@@ -283,6 +283,7 @@ const PNET_LEGACY_PRIORITY_GROUP: usize = 4;
 // other local queries and avoid consuming the burst quota at startup.
 const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
 const PNET_RETRY_PERIOD: Duration = Duration::from_secs(1);
+const PNET_STATUS_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const PNET_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const PNET_SESSION_COALESCE: Duration = Duration::from_millis(100);
 const PNET_EVENT_DRAIN_LIMIT: usize = 64;
@@ -546,6 +547,33 @@ fn pnet_status_admits(peer: &NodeId, status: &PnetStatus, now: u64) -> bool {
         && status.admitted
         && status.has_cert
         && (status.valid_until_unix == 0 || (now != 0 && now < status.valid_until_unix))
+}
+
+struct StatusReconnect {
+    next_attempt: Instant,
+    delay: Duration,
+}
+
+impl Default for StatusReconnect {
+    fn default() -> Self {
+        Self {
+            next_attempt: Instant::now(),
+            delay: PNET_STATUS_RETRY_INITIAL,
+        }
+    }
+}
+
+impl StatusReconnect {
+    fn attempted(&mut self, now: Instant) {
+        self.next_attempt = now + self.delay;
+        self.delay = (self.delay * 2).min(PNET_REFRESH_PERIOD);
+    }
+
+    fn confirmed(&mut self) {
+        if self.delay != PNET_STATUS_RETRY_INITIAL {
+            *self = Self::default();
+        }
+    }
 }
 
 async fn connect_pnet_status(
@@ -1920,6 +1948,7 @@ async fn maintain_routes(
     let mut hup = hup.lock().await;
     let mut admitted = HashMap::new();
     let mut connection: Option<Arc<VeilClient>> = None;
+    let mut status_reconnect = StatusReconnect::default();
     let mut session_refresh: Option<SessionRefresh> = None;
     let mut next_session_sweep = Instant::now();
     let mut active_policy = None;
@@ -1951,7 +1980,6 @@ async fn maintain_routes(
             session_refresh = None;
             next_peer = 0;
             next_session_sweep = Instant::now();
-            refresh.reset_immediately();
         }
         // Read a bounded group of buffered events before the next paced
         // query. One event per query can delay a hint behind busy sessions.
@@ -1991,10 +2019,14 @@ async fn maintain_routes(
         let priority_ready = priority_check.is_some_and(|(due, _)| due <= now);
         let sessions_ready =
             may_recheck_sessions && session_due_at.is_some_and(|due| due <= now) || priority_ready;
+        let next_status_attempt = (connection.is_none() && !configured.peer_app_ids.is_empty())
+            .then_some(status_reconnect.next_attempt);
         let wake = tokio::select! {
             _ = wait_status_disconnect(connection.as_deref()) => Wake::StatusDisconnected,
             _ = async {
-                if next_peer == 0 {
+                if let Some(due) = next_status_attempt {
+                    tokio::time::sleep_until(due).await;
+                } else if next_peer == 0 {
                     refresh.tick().await;
                 }
             }, if config.pnet_required && !sessions_ready => Wake::Sweep,
@@ -2115,6 +2147,7 @@ async fn maintain_routes(
                 } else {
                     admitted.clear();
                     connection = None;
+                    status_reconnect = StatusReconnect::default();
                     session_refresh = None;
                     configured.clone()
                 };
@@ -2213,11 +2246,18 @@ async fn maintain_routes(
         }
         let mut legacy_group_limit = PNET_LEGACY_QUERY_GROUP;
         if connection.is_none() {
+            if Instant::now() < status_reconnect.next_attempt {
+                continue;
+            }
             let authority = binding.signed.as_ref().map(|(_, authority)| *authority);
             connection =
                 connect_pnet_status(&config.socket_path, binding.node_id, authority, &mut pace)
                     .await;
+            // An accepted handshake can still fail before any status reply.
+            // Back off until a complete query confirms this connection.
+            status_reconnect.attempted(Instant::now());
             if let Some(client) = &connection {
+                refresh.reset();
                 let batched_admission = client.supports_pnet_admission_batch();
                 session_refresh = Some(SessionRefresh::new(client.events_with_lag().await));
                 let group_limit = if batched_admission {
@@ -2384,6 +2424,9 @@ async fn maintain_routes(
             if client.is_disconnected() {
                 continue;
             }
+            if response.is_some() && !reconnect_legacy {
+                status_reconnect.confirmed();
+            }
             match response {
                 Some(results) => {
                     if apply_admissions(&retry, results, &mut admitted, &binding) {
@@ -2434,6 +2477,8 @@ async fn maintain_routes(
             if reconnect_legacy {
                 connection = None;
                 session_refresh = None;
+            } else if response.is_some() {
+                status_reconnect.confirmed();
             }
             results = response;
         } else {
@@ -3028,6 +3073,22 @@ mod tests {
     }
 
     #[test]
+    fn status_reconnect_backoff_caps_and_resets_after_confirmation() {
+        let mut retry = StatusReconnect::default();
+        let now = Instant::now();
+        for delay in [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000] {
+            retry.attempted(now);
+            assert_eq!(retry.next_attempt, now + Duration::from_millis(delay));
+        }
+
+        retry.confirmed();
+        let now = Instant::now();
+        assert!(retry.next_attempt <= now);
+        retry.attempted(now);
+        assert_eq!(retry.next_attempt, now + PNET_STATUS_RETRY_INITIAL);
+    }
+
+    #[test]
     fn withdrawal_and_readmission_share_the_early_check_interval() {
         let now = Instant::now();
         let next = now + PNET_PRIORITY_RECHECK_SPACING;
@@ -3203,7 +3264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pnet_routes_withdraw_when_idle_status_ipc_closes() {
+    async fn pnet_routes_withdraw_on_idle_ipc_close_and_retry_a_refused_reconnect() {
         exercise_status_ipc_close(false).await;
     }
 
@@ -3290,6 +3351,7 @@ mod tests {
                 _ = replies => {},
                 _ = closing => {},
             }
+            (listener, socket)
         });
 
         let config = pnet_sweep_config(&proxy_socket, 2);
@@ -3336,12 +3398,33 @@ mod tests {
             assert_eq!(state.load().table.peer_count(), 2);
         }
         close.send(()).unwrap();
-        proxy.await.unwrap();
+        let (listener, socket) = proxy.await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), wait_for_route_count(0))
             .await
             .expect("routes stayed published after the status IPC closed");
+        let recovered_proxy = if hold_reply {
+            None
+        } else {
+            let task = tokio::spawn(async move {
+                let (refused, _) = listener.accept().await.unwrap();
+                drop(refused);
+                let (mut front, _) = listener.accept().await.unwrap();
+                let mut backend = UnixStream::connect(&socket).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut front, &mut backend).await;
+            });
+            tokio::time::timeout(Duration::from_secs(2), wait_for_route_count(2))
+                .await
+                .expect(
+                    "a refused status reconnect delayed fresh admission until the regular sweep",
+                );
+            Some(task)
+        };
         updates.abort();
         assert!(updates.await.unwrap_err().is_cancelled());
+        if let Some(task) = recovered_proxy {
+            task.abort();
+            let _ = task.await;
+        }
         stop.send(true).unwrap();
         server.await.unwrap();
     }

@@ -1019,6 +1019,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   IPC, yielding 0.086 s withdrawal. Signed policy with a held batch
   reply withdrew in 0.115 s. Both runs kept their SDK flows and resumed
   bidirectional traffic on their existing TUN interfaces.
+- Status IPC retries have a separate deadline from the regular route
+  sweep. The gateway can reconnect immediately after a confirmed status
+  connection closes. The wait after an unconfirmed attempt grows from
+  250 ms to five seconds. A complete admission reply resets the delay.
+- On a two-node Linux ARM64 stand, a proxy briefly refused status IPC
+  reconnects. Both gateways withdrew their routes in about 0.11 s and
+  blocked tunnel probes during the outage. Once the proxy accepted
+  status connections again, the candidate restored TUN traffic in
+  0.467 s versus 4.865 s with the control. Both kept their existing
+  data IPC connection, TUN interfaces and SDK processes. The same
+  candidate test restored traffic in 0.544 s with a pre-batch daemon
+  and raw packet IPC and in 0.479 s with signed route policy.
 
 ### Remote session changes with pre-batch daemons
 
