@@ -837,6 +837,39 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   stand, a ban withdrew the route in 4.78 s. While the sender kept
   running, the receiver's TUN counter stopped advancing after withdrawal.
 
+#### CPU placement during cold start
+
+- Two paired runs on the same two-vCPU Linux ARM64 stand used unchanged
+  binaries, 24 gateways with 4,096 entries each, and two 32 Mb/s UDP
+  flows over TCP. The hub, the gateways and the senders kept the same
+  configured Tokio worker counts. Both measured senders stayed on CPU 1.
+  The dedicated layout placed only the hub container on CPU 0 and the
+  other containers on CPU 1. In the shared layout, the unpinned containers
+  could use both CPUs. Each trial sent 167,272 datagrams.
+- With the default CPU weights, the dedicated layout reduced the hub's
+  thread runnable wait from 19.18 and 20.12 s to 2.63 and 3.15 s. The
+  two TCP senders stopped reporting receive-window pressure, but about
+  48,000 offers per trial were at least 15 ms late. Peak sender bursts
+  exceeded 1,700 packets per 100 ms. UDP losses rose from 35,959 and
+  34,011 to 39,496 and 42,032. This placement moved CPU pressure to
+  the sending side as well as relieving the hub.
+- The next two pairs repeated the layouts with the same higher CPU
+  weight on the two measured senders in both arms. The senders had
+  weight 3,023 and the hub had weight 100. Starts within each run were
+  aligned within 0.28 ms, and each sender offered 7,272 or 7,273
+  datagrams in the first two seconds. The shared runs still had peaks of
+  up to 463 packets per 100 ms, compared with 385 on the dedicated runs.
+  UDP losses went from 44,320 and 41,263 to zero in the two pairs. The
+  senders logged zero IPC job refusals in both dedicated trials.
+- In those pairs the hub's summed thread runnable wait fell from
+  21.47 and 23.37 s to 3.90 and 3.53 s. Its peak TCP receive queue fell
+  from 589 and 571 kB to 19 and 46 kB, and the senders again reported
+  zero receive-window-limited time with the dedicated layout. Each run
+  delivered all 200 SDK messages without duplicates. p99 towards the
+  hub fell from 824 and 644 ms to 5.16 and 4.16 ms. In the other direction
+  it fell from 247 and 252 ms to 4.38 and 5.28 ms. These are sizing
+  measurements for this particular shared host and offered load.
+
 #### xVeil text delivery on a shared gateway
 
 - A two-vCPU Linux ARM64 hub served 24 gateways with disjoint 4,096-entry

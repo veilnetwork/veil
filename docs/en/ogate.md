@@ -349,6 +349,23 @@ format = "text"
 RUST_LOG="ogate=debug,veilclient=info" sudo -u veil ogate up --config /etc/ogate/ogate.toml
 ```
 
+## CPU capacity for shared P-Net gateways
+
+Budget CPU for the receiving Veil process and its ogate interfaces together.
+Reserve capacity for the senders as well. On a shared host, moving all other
+work onto the senders' CPUs can increase packet loss even when the hub's TCP
+receive queues shrink.
+
+Test the first burst after startup with the intended number of peers. Compare
+actual sender rates over short windows, end-to-end UDP loss, and chat latency
+in both directions. Compare the daemon's
+`veil_ipc_send_admission_jobs_rejected_total` with receive socket drops to
+distinguish source IPC refusals from losses at the receiving application.
+An IPC request can carry several datagrams.
+Use an isolated VM or CPU allocation if the hub spends substantial time
+runnable while its TCP receive queues build. Recheck sender timing with the
+new placement. [24-gateway Linux measurements](../internal/p-net-roadmap.md#cpu-placement-during-cold-start)
+
 ## Rolling it out with Ansible
 
 The repo ships two playbooks: `ansible/deploy-ogate.yml` to roll `ogate`
