@@ -4,7 +4,7 @@
 //! Extracted from `runtime/mod.rs` during refactor.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -12,7 +12,7 @@ use veil_abuse::BanList;
 use veil_dht::KademliaService;
 use veil_identity::network_access::NetworkAccessGate;
 use veil_identity::network_ban::{BAN_BLOB_MAGIC, ban_dht_key};
-use veil_session::SessionOutbox;
+use veil_session::{SendToError, SessionOutbox, SessionTxRegistry};
 use veil_util::{lock, rlock};
 
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
@@ -20,12 +20,24 @@ use super::{NodeRuntime, lock_tasks, supervised_spawn};
 const BAN_CATCH_UP_COOLDOWN: Duration = Duration::from_secs(15);
 const BAN_CATCH_UP_MAX_CHECKS: usize = 32;
 const BAN_CATCH_UP_MAX_RECIPIENTS: usize = 8;
+const BAN_RETRY_PER_TICK: usize = BAN_CATCH_UP_MAX_RECIPIENTS / 2;
+const BAN_RETRY_CAPACITY: usize = 256;
+const BAN_RETRY_ATTEMPTS: u8 = 3;
+const BAN_RETRY_LIFETIME: Duration = Duration::from_secs(15);
 
 type SessionRegistration = ([u8; 32], [u8; 32]);
 
 struct BanReplicaBatch<'a> {
+    key: [u8; 32],
     frame: Vec<u8>,
     recipients: &'a [SessionRegistration],
+}
+
+struct BanRetry {
+    key: [u8; 32],
+    registration: SessionRegistration,
+    deadline: Instant,
+    attempts_left: u8,
 }
 
 #[derive(Default)]
@@ -44,6 +56,7 @@ struct BanCatchUp {
     fresh: BanReplicaQueue,
     pending_fresh: BTreeSet<[u8; 32]>,
     prefer_reconnect: bool,
+    retries: VecDeque<BanRetry>,
 }
 
 impl BanCatchUp {
@@ -62,9 +75,12 @@ impl BanCatchUp {
             self.pending_fresh.clear();
             self.reconnect = BanReplicaQueue::default();
             self.fresh = BanReplicaQueue::default();
+            self.retries.clear();
         } else if self.sessions != current {
             self.pending
                 .retain(|registration| current.binary_search(registration).is_ok());
+            self.retries
+                .retain(|retry| current.binary_search(&retry.registration).is_ok());
             self.pending.extend(
                 current
                     .iter()
@@ -116,7 +132,11 @@ impl BanCatchUp {
         };
     }
 
-    fn next_batch(&mut self, dht: &KademliaService) -> Option<(&'static str, BanReplicaBatch<'_>)> {
+    fn next_batch(
+        &mut self,
+        dht: &KademliaService,
+        limit: usize,
+    ) -> Option<(&'static str, BanReplicaBatch<'_>)> {
         let reconnect = (&mut self.reconnect, "network.ban.catch_up");
         let fresh = (&mut self.fresh, "network.ban.forwarded");
         let (first, second) = if self.prefer_reconnect {
@@ -127,27 +147,108 @@ impl BanCatchUp {
         self.prefer_reconnect = !self.prefer_reconnect;
         first
             .0
-            .next_batch(dht)
+            .next_batch(dht, limit)
             .map(|batch| (first.1, batch))
-            .or_else(|| second.0.next_batch(dht).map(|batch| (second.1, batch)))
+            .or_else(|| {
+                second
+                    .0
+                    .next_batch(dht, limit)
+                    .map(|batch| (second.1, batch))
+            })
+    }
+
+    fn defer_full_queue(&mut self, key: [u8; 32], registration: SessionRegistration, now: Instant) {
+        if self.retries.len() < BAN_RETRY_CAPACITY
+            && !self
+                .retries
+                .iter()
+                .any(|retry| retry.key == key && retry.registration == registration)
+        {
+            self.retries.push_back(BanRetry {
+                key,
+                registration,
+                deadline: now + BAN_RETRY_LIFETIME,
+                attempts_left: BAN_RETRY_ATTEMPTS,
+            });
+        }
+    }
+
+    fn send_next_batch(
+        &mut self,
+        dht: &KademliaService,
+        bans: &Mutex<BanList>,
+        senders: &RwLock<SessionTxRegistry>,
+        limit: usize,
+        now: Instant,
+    ) -> Option<(&'static str, u64)> {
+        let (event, batch) = self.next_batch(dht, limit)?;
+        let mut sent = 0;
+        let mut full = Vec::new();
+        for registration in batch.recipients {
+            match send_ban_replica(dht, bans, senders, registration, batch.frame.clone()) {
+                Ok(()) => sent += 1,
+                Err(SendToError::Full) => full.push(*registration),
+                Err(_) => {}
+            }
+        }
+        let key = batch.key;
+        for registration in full {
+            self.defer_full_queue(key, registration, now);
+        }
+        Some((event, sent))
+    }
+
+    fn retry_full_queues(
+        &mut self,
+        dht: &KademliaService,
+        bans: &Mutex<BanList>,
+        senders: &RwLock<SessionTxRegistry>,
+        now: Instant,
+    ) -> (usize, u64) {
+        self.retries.retain(|retry| retry.deadline > now);
+        let attempts = self.retries.len().min(BAN_RETRY_PER_TICK);
+        let mut sent = 0;
+        // Use the length at entry so a still-full queue is tried at most
+        // once in this tick. New publications share the remaining budget.
+        for _ in 0..attempts {
+            let Some(mut retry) = self.retries.pop_front() else {
+                break;
+            };
+            let Some(value) = dht.peek_value(&retry.key) else {
+                continue;
+            };
+            let Ok(frame) = dht.build_private_ban_replica(retry.key, value) else {
+                continue;
+            };
+            match send_ban_replica(dht, bans, senders, &retry.registration, frame) {
+                Ok(()) => sent += 1,
+                Err(SendToError::Full) if retry.attempts_left > 1 => {
+                    retry.attempts_left -= 1;
+                    self.retries.push_back(retry);
+                }
+                Err(_) => {}
+            }
+        }
+        (attempts, sent)
     }
 }
 
 impl BanReplicaQueue {
-    fn next_batch(&mut self, dht: &KademliaService) -> Option<BanReplicaBatch<'_>> {
+    fn next_batch(&mut self, dht: &KademliaService, limit: usize) -> Option<BanReplicaBatch<'_>> {
         for _ in 0..BAN_CATCH_UP_MAX_CHECKS {
             let key = *self.keys.front()?;
             if let Some(value) = dht.peek_value(&key)
                 && let Ok(frame) = dht.build_private_ban_replica(key, value)
             {
                 let start = self.next_recipient;
-                let end = (start + BAN_CATCH_UP_MAX_RECIPIENTS).min(self.recipients.len());
+                let end = (start + limit).min(self.recipients.len());
                 self.next_recipient = end;
                 if end == self.recipients.len() {
                     self.keys.pop_front();
                     self.next_recipient = 0;
                 }
                 return Some(BanReplicaBatch {
+                    key,
                     frame,
                     recipients: &self.recipients[start..end],
                 });
@@ -157,6 +258,25 @@ impl BanReplicaQueue {
         }
         None
     }
+}
+
+fn send_ban_replica(
+    dht: &KademliaService,
+    bans: &Mutex<BanList>,
+    senders: &RwLock<SessionTxRegistry>,
+    (peer, owner): &SessionRegistration,
+    frame: Vec<u8>,
+) -> Result<(), SendToError> {
+    if !dht.peer_serves_dht(peer) {
+        return Err(SendToError::Missing);
+    }
+    // Registration checks the ban list while holding the sender registry.
+    let senders = rlock!(senders);
+    let bans = lock!(bans);
+    if bans.is_banned(peer) {
+        return Err(SendToError::Missing);
+    }
+    senders.send_to_owned_result(peer, owner, veil_proto::priority::BACKGROUND, frame)
 }
 
 fn republishable_record_at(
@@ -370,24 +490,22 @@ impl NodeRuntime {
                     }
                     _ = tick_interval.tick() => {
                         if let Some(gate) = &network_gate {
+                            let now = Instant::now();
                             ban_catch_up.observe_sessions(
-                                &dht, &session_outbox, &bans, &gate.expected_network_id, Instant::now(),
+                                &dht, &session_outbox, &bans, &gate.expected_network_id, now,
                             );
-                            if let Some((event, batch)) = ban_catch_up.next_batch(&dht) {
-                                let mut sent = 0;
-                                for (peer, owner) in batch.recipients {
-                                    if !dht.peer_serves_dht(peer) {
-                                        continue;
-                                    }
-                                    let senders = rlock!(session_senders);
-                                    if !lock!(bans).is_banned(peer)
-                                        && senders.send_to_owned_result(
-                                            peer, owner, veil_proto::priority::BACKGROUND, batch.frame.clone(),
-                                        ).is_ok()
-                                    {
-                                        sent += 1;
-                                    }
+                            let (attempts, retried) = ban_catch_up.retry_full_queues(
+                                &dht, &bans, &session_senders, now,
+                            );
+                            if retried > 0 {
+                                if let Some(m) = &metrics {
+                                    m.add_replicas_published(retried);
                                 }
+                                logger.info("network.ban.retry", format!("replicas_sent={retried}"));
+                            }
+                            if let Some((event, sent)) = ban_catch_up.send_next_batch(
+                                &dht, &bans, &session_senders, BAN_CATCH_UP_MAX_RECIPIENTS - attempts, now,
+                            ) {
                                 if sent > 0 {
                                     if let Some(m) = &metrics {
                                         m.add_replicas_published(sent);
@@ -486,16 +604,28 @@ impl NodeRuntime {
 mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use veil_crypto::space_discovery::{SpaceDiscoveryRecord, SpaceDiscoveryRoute};
+    use veil_dht::NetworkAuthGate;
     use veil_identity::network_ban::{ban_dht_key, canonical_ban_body, encode_ban_blob};
     use veil_identity::network_cert::{canonical_cert_body, encode_cert_blob};
+    use veil_proto::priority;
     use veil_types::{
         BAN_ENTRY_VERSION, BanEntry, MEMBERSHIP_CERT_VERSION, MembershipCert, SignatureAlgorithm,
     };
 
     use super::{
-        BAN_CATCH_UP_COOLDOWN, BanCatchUp, BanList, Duration, Instant, KademliaService, Mutex,
-        NetworkAccessGate, NodeRuntime, SessionOutbox, republishable_record_at,
+        BAN_CATCH_UP_COOLDOWN, BAN_CATCH_UP_MAX_RECIPIENTS, BAN_RETRY_ATTEMPTS, BAN_RETRY_CAPACITY,
+        BAN_RETRY_LIFETIME, BAN_RETRY_PER_TICK, BanCatchUp, BanList, Duration, Instant,
+        KademliaService, Mutex, NetworkAccessGate, NodeRuntime, RwLock, SessionOutbox,
+        SessionTxRegistry, republishable_record_at,
     };
+
+    struct TestGate;
+
+    impl NetworkAuthGate for TestGate {
+        fn verify_ban_record(&self, _key: &[u8; 32], value: &[u8]) -> bool {
+            value == b"PBAN-verified"
+        }
+    }
 
     #[test]
     fn ban_catch_up_uses_new_authenticated_registrations_and_coalesces_flaps() {
@@ -560,15 +690,6 @@ mod tests {
 
     #[test]
     fn ban_catch_up_batches_all_new_peers_with_a_fixed_send_budget() {
-        use veil_dht::{KademliaService, NetworkAuthGate};
-
-        struct TestGate;
-        impl NetworkAuthGate for TestGate {
-            fn verify_ban_record(&self, _key: &[u8; 32], value: &[u8]) -> bool {
-                value == b"PBAN-verified"
-            }
-        }
-
         let network = [1; 32];
         let target = [2; 32];
         let key = ban_dht_key(&network, &target);
@@ -584,8 +705,9 @@ mod tests {
         let mut catch_up = BanCatchUp::default();
         catch_up.observe_sessions(&dht, &outbox, &Mutex::new(bans), &network, Instant::now());
         let mut delivered = Vec::new();
-        for expected in [8, 8, 3] {
-            let (event, batch) = catch_up.next_batch(&dht).unwrap();
+        let reduced_budget = BAN_CATCH_UP_MAX_RECIPIENTS - BAN_RETRY_PER_TICK;
+        for (limit, expected) in [(reduced_budget, 4), (8, 8), (8, 7)] {
+            let (event, batch) = catch_up.next_batch(&dht, limit).unwrap();
             assert_eq!(event, "network.ban.catch_up");
             assert_eq!(batch.recipients.len(), expected);
             let header = veil_proto::codec::decode_header(&batch.frame).unwrap();
@@ -597,8 +719,126 @@ mod tests {
             delivered.extend(batch.recipients.iter().map(|(peer, _)| peer[0]));
         }
         assert_eq!(delivered, (10..29).collect::<Vec<_>>());
-        assert!(catch_up.next_batch(&dht).is_none());
+        assert!(
+            catch_up
+                .next_batch(&dht, BAN_CATCH_UP_MAX_RECIPIENTS)
+                .is_none()
+        );
         drop(receivers);
+    }
+
+    #[test]
+    fn a_full_session_queue_retries_the_signed_ban_when_it_drains() {
+        let key = [7; 32];
+        let peer = [8; 32];
+        let owner = [9; 32];
+        let mut dht = KademliaService::new([100; 32]);
+        dht.set_network_auth_gate(std::sync::Arc::new(TestGate));
+        dht.store_local(key, b"PBAN-verified".to_vec());
+        let bans = Mutex::new(BanList::new());
+        let mut senders = SessionTxRegistry::with_capacity(1);
+        let mut rx = senders.register_owned(peer, owner);
+        senders
+            .send_to_owned_result(&peer, &owner, priority::INTERACTIVE, b"busy".to_vec())
+            .unwrap();
+        let senders = RwLock::new(senders);
+        let mut catch_up = BanCatchUp::default();
+        catch_up.fresh.keys.push_back(key);
+        catch_up.fresh.recipients.push((peer, owner));
+        let now = Instant::now();
+
+        assert_eq!(
+            catch_up.send_next_batch(&dht, &bans, &senders, BAN_CATCH_UP_MAX_RECIPIENTS, now),
+            Some(("network.ban.forwarded", 0)),
+        );
+        assert_eq!(catch_up.retries.len(), 1);
+        catch_up.defer_full_queue(key, (peer, owner), now);
+        let tick = Duration::from_secs(1);
+        assert_eq!(
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + tick),
+            (1, 0)
+        );
+        assert_eq!(catch_up.retries[0].attempts_left, BAN_RETRY_ATTEMPTS - 1);
+        assert_eq!(rx.try_recv().unwrap().1.as_ref(), b"busy");
+
+        assert_eq!(
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + 2 * tick),
+            (1, 1)
+        );
+        let (prio, frame) = rx.try_recv().unwrap();
+        assert_eq!(prio, priority::BACKGROUND);
+        let body = &frame.as_ref()[veil_proto::header::HEADER_SIZE..];
+        let store = veil_proto::discovery::StorePayload::decode(body).unwrap();
+        assert_eq!(store.key, key);
+        assert_eq!(store.value, b"PBAN-verified");
+        assert!(catch_up.retries.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn retries_are_bounded_and_check_the_current_record_and_registration() {
+        let key = [7; 32];
+        let peer = [8; 32];
+        let stale_owner = [9; 32];
+        let owner = [10; 32];
+        let mut dht = KademliaService::new([100; 32]);
+        dht.set_network_auth_gate(std::sync::Arc::new(TestGate));
+        dht.store_local(key, b"PBAN-verified".to_vec());
+        let bans = Mutex::new(BanList::new());
+        let mut senders = SessionTxRegistry::with_capacity(1);
+        let mut rx = senders.register_owned(peer, owner);
+        let senders = RwLock::new(senders);
+        let mut catch_up = BanCatchUp::default();
+        let now = Instant::now();
+        let tick = Duration::from_secs(1);
+
+        catch_up.defer_full_queue(key, (peer, stale_owner), now);
+        assert_eq!(
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + tick),
+            (1, 0)
+        );
+        assert!(catch_up.retries.is_empty());
+        assert!(rx.try_recv().is_err());
+
+        senders
+            .read()
+            .unwrap()
+            .send_to_owned_result(&peer, &owner, priority::INTERACTIVE, b"busy".to_vec())
+            .unwrap();
+        catch_up.defer_full_queue(key, (peer, owner), now);
+        for attempt in 1..=u32::from(BAN_RETRY_ATTEMPTS) {
+            assert_eq!(
+                catch_up.retry_full_queues(&dht, &bans, &senders, now + attempt * tick),
+                (1, 0)
+            );
+        }
+        assert!(catch_up.retries.is_empty());
+        rx.try_recv().unwrap();
+
+        catch_up.defer_full_queue(key, (peer, owner), now);
+        dht.store_local(key, b"PBAN-invalid".to_vec());
+        assert_eq!(
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + tick),
+            (1, 0)
+        );
+        assert!(catch_up.retries.is_empty());
+        assert!(rx.try_recv().is_err());
+
+        for i in 0..=BAN_RETRY_CAPACITY {
+            let mut distinct_key = key;
+            distinct_key[..2].copy_from_slice(&(i as u16).to_le_bytes());
+            catch_up.defer_full_queue(distinct_key, (peer, owner), now);
+        }
+        assert_eq!(catch_up.retries.len(), BAN_RETRY_CAPACITY);
+        assert_eq!(
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + tick),
+            (BAN_RETRY_PER_TICK, 0)
+        );
+        assert_eq!(
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + BAN_RETRY_LIFETIME),
+            (0, 0)
+        );
+        assert!(catch_up.retries.is_empty());
     }
 
     #[test]

@@ -1671,6 +1671,11 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   reconnect catch-up. The revoked TUN path stopped in both directions,
   the unrevoked path stayed available, and all 48 SDK messages arrived
   exactly once.
+- If a local session queue is full, the replication task retries for the
+  same authenticated session up to three times within 15 seconds. Each
+  retry checks the current signed record and the session again. The retry
+  queue holds at most 256 entries and uses at most four of the eight
+  sends per tick.
 
 #### Enforcing revocations on relayed application datagrams
 
