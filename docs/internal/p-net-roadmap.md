@@ -1052,6 +1052,12 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   once. The bridge withdrew the route 0.859 s after disconnect and
   passed bidirectional TUN probes 0.586 s after readmission on the
   same interfaces.
+- The shared `FIND_NODE` and `FIND_VALUE` referral path now skips the
+  requester's own node ID before resolving transport addresses. A remote
+  routing table can include the requester, but it cannot become a route
+  to another member. The regression test supplies both session endpoints
+  as referrals and confirms that a third, cached contact still returns
+  without any `ResolveTransport` requests.
 
 #### TCP receive queues during cold bulk traffic
 
@@ -1093,6 +1099,25 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   SDK probe collects messages for four seconds after its last send
   and does not use an end-to-end acknowledgement. This configuration
   failed the cold-load SDK delivery gate.
+
+#### TCP and QUIC after routes settle
+
+- Two pairs on the same two-vCPU Linux ARM64 stand used the same
+  `d573beec` daemon as the cold comparison. All 48 sessions authenticated
+  and all 24 gateway pairs passed bidirectional TUN probes before a
+  60-second settling period. The two 32 Mb/s UDP flows started 64.6–64.7 s
+  after member admission. The mixed variant used QUIC for the two
+  measured links and TCP for the other 46.
+- Every trial delivered all 167,272 UDP datagrams and all 200 SDK test
+  messages without duplicates. All 24 TUN paths passed bidirectional
+  probes after each sample. SDK p99 towards the hub changed from 1.83
+  to 2.30 ms and from 2.72 to 2.06 ms. Return p99 changed from 1.75 to
+  2.18 ms and from 1.87 to 2.45 ms.
+- In the first ten seconds, the other 46 peer containers consumed
+  0.15–0.16 CPU-s in aggregate, compared with about 9 CPU-s during the
+  cold comparison. Over those ten seconds, hub container CPU rose from
+  2.89 to 3.42 CPU-s and from 3.11 to 3.61 CPU-s with the mixed transport.
+  TCP met the same delivery target at lower hub CPU cost on this stand.
 
 #### xVeil text delivery on a shared gateway
 

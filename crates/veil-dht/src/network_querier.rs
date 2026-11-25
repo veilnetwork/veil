@@ -312,8 +312,9 @@ impl NetworkPeerQuerier {
         // optimisation.
         let mut contacts = Vec::with_capacity(node_ids.len());
         for nid in node_ids {
-            // Skip self (the routing table never returns self, but be defensive).
-            if nid == via_peer {
+            // A responder may know our ID. Neither end of this existing
+            // session needs a transport lookup to become a new contact.
+            if nid == self.local_node_id || nid == via_peer {
                 continue;
             }
             // Cache hit?
@@ -411,8 +412,47 @@ impl PeerQuerier for NetworkPeerQuerier {
 }
 
 #[cfg(test)]
-mod request_id_tests {
+mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_referrals_skip_the_local_node_and_responder() {
+        struct NoRequests;
+        impl FrameRouter for NoRequests {
+            fn send_request(
+                &self,
+                _peer: [u8; 32],
+                _request_id: u32,
+                _frame: Vec<u8>,
+            ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+                panic!("self, responder, and cached referrals need no transport RPC");
+            }
+
+            fn peer_ids(&self) -> Vec<[u8; 32]> {
+                vec![[2; 32]]
+            }
+        }
+
+        let local = [1; 32];
+        let responder = [2; 32];
+        let cached = [3; 32];
+        let querier =
+            NetworkPeerQuerier::new(Arc::new(NoRequests), 20, Duration::from_secs(1), local);
+        let transport = "tcp://cached.example:9000";
+        querier
+            .cache()
+            .lock()
+            .unwrap()
+            .insert(cached, transport.to_owned());
+
+        let contacts = querier
+            .resolve_node_ids(responder, vec![local, responder, cached])
+            .await;
+
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].node_id, cached);
+        assert_eq!(contacts[0].transport, transport);
+    }
 
     /// Ids must be unique across "querier instances" (the free fn IS the
     /// shared source) and across threads, and 0 must never be handed out —
