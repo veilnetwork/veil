@@ -8,6 +8,11 @@
   become: true
   strategy: ansible.builtin.linear
   any_errors_fatal: true
+  pre_tasks:
+    - name: Validate tunnel probe settings before activation
+      ansible.builtin.include_tasks: tasks/pnet-tunnel-probes.yml
+      vars:
+        pnet_validate_tunnel_probes: true
   roles:
     - role: pnet_candidate
       pnet_apply: false
@@ -23,3 +28,5 @@
     - role: pnet_candidate
       pnet_apply: true
       when: not ansible_check_mode
+
+- ansible.builtin.import_playbook: check-pnet-tunnels.yml

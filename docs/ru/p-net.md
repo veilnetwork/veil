@@ -663,12 +663,35 @@ veil-cli network route-policy recover-owner --check --policy next.bin \
 `pnet_mode=private_configured` включает обнаружение только через
 указанные точки входа. При повторной установке этот режим сохраняется.
 
+Чтобы проверять передачу пакетов после раскатки, задайте
+`pnet_tunnel_probes` в инвентаре для нужных шлюзов.
+
+```yaml
+pnet_tunnel_probes:
+  - interface: pnet0
+    address: 198.18.23.2
+  - interface: pnet0
+    address: "fd42:198:23::2"
+```
+
+Укажите виртуальные адреса удалённых узлов, доступных через этот TUN.
+На шлюзе Linux нужны `ip` из iproute2 и `ping` из iputils. Первый этап
+проверяет настройки и наличие утилит. Когда все выбранные хосты
+завершат переключение, отдельный этап ждёт ответа на эхо-запрос через
+каждый указанный TUN. У проб на одном хосте общий срок ожидания
+`pnet_tunnel_probe_timeout`, по умолчанию 45 секунд. Если этот срок
+истечёт, плейбук укажет проблемные маршруты и оставит применённую
+конфигурацию в силе.
+
 ```bash
 # Проверить выбранные узлы без переключения:
 ansible-playbook -i inventory.yml deploy-pnet.yml --check
 
 # Раскатать:
 ansible-playbook -i inventory.yml deploy-pnet.yml
+
+# Повторить проверку TUN без перезапуска служб
+ansible-playbook -i inventory.yml check-pnet-tunnels.yml
 
 # Вернуть публичный режим:
 ansible-playbook -i inventory.yml revert-pnet.yml

@@ -1,0 +1,20 @@
+---
+- name: Run configured P-Net tunnel probes
+  when: pnet_tunnel_probes | default([]) != []
+  block:
+    - name: Check selected TUN traffic or validate probe settings
+      ansible.builtin.script:
+        cmd: >-
+          {{ (playbook_dir ~ '/files/check-pnet-tunnels.py') | quote }}
+          {{ '--validate' if pnet_validate_tunnel_probes else '' }}
+          --wait-seconds {{ pnet_tunnel_probe_timeout | default(45) | string | quote }}
+          -- {{ pnet_tunnel_probes | to_json | quote }}
+        executable: "{{ pnet_python | default('python3') }}"
+      register: pnet_tunnel_result
+      check_mode: false
+      changed_when: false
+
+    - name: Report verified tunnel paths
+      ansible.builtin.debug:
+        msg: "{{ pnet_tunnel_result.stdout_lines }}"
+      when: not pnet_validate_tunnel_probes

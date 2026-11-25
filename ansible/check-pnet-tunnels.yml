@@ -1,0 +1,11 @@
+---
+- name: Verify configured P-Net tunnel paths
+  hosts: all
+  gather_facts: false
+  become: true
+  strategy: ansible.builtin.linear
+  tasks:
+    - name: Check selected hosts' TUN paths
+      ansible.builtin.include_tasks: tasks/pnet-tunnel-probes.yml
+      vars:
+        pnet_validate_tunnel_probes: "{{ ansible_check_mode }}"

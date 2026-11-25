@@ -651,12 +651,35 @@ Use the signed-config or owner-rotation procedure for those changes.
 `pnet_mode=private_configured` selects configured-only discovery for a
 new deployment. Subsequent deployments preserve this discovery mode.
 
+To check the packet path as part of rollout, set `pnet_tunnel_probes` in
+the inventory of each gateway you want to test.
+
+```yaml
+pnet_tunnel_probes:
+  - interface: pnet0
+    address: 198.18.23.2
+  - interface: pnet0
+    address: "fd42:198:23::2"
+```
+
+Use remote virtual addresses reachable through the named TUN interface.
+The managed gateway needs Linux `ip` from iproute2 and `ping` from
+iputils. The first play validates the settings and verifies that the
+tools are installed. After all selected hosts finish activation, a
+separate play waits for an echo reply through each configured TUN
+path. The probes share a timeout per host, which can be set with
+`pnet_tunnel_probe_timeout` and defaults to 45 seconds. A timeout reports
+the failed paths and leaves the activated configuration in place.
+
 ```bash
 # Verify the selected hosts without activating the candidates:
 ansible-playbook -i inventory.yml deploy-pnet.yml --check
 
 # Roll out:
 ansible-playbook -i inventory.yml deploy-pnet.yml
+
+# Recheck the tunnel paths independently
+ansible-playbook -i inventory.yml check-pnet-tunnels.yml
 
 # Return to public mode:
 ansible-playbook -i inventory.yml revert-pnet.yml

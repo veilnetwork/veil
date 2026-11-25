@@ -1784,3 +1784,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   succeeded within 0.25 s and 0.19 s of the play finishing. Each pair
   received at least 1,000 SDK messages in each direction before the
   switch, after it, and after the repeat. All stand services exited.
+
+## 9. Verify the packet path after rollout
+
+- Inventory can select remote virtual IPv4 and IPv6 addresses and the
+  TUN interfaces to test. Ansible validates probe settings before any
+  activation. It checks the packet paths after the final host has
+  switched. A separate playbook can run the same check independently.
+- A Debian 12 ARM64 systemd stand kept healthy metrics endpoints and
+  active TUN interfaces while the public daemon denied the private
+  packet paths. The standalone check reported missing echo replies.
+  An invalid address stopped the entire rollout before either node
+  restarted. A successful rollout verified all four directed
+  IPv4 and IPv6 paths on the same TUN devices and recovered SDK chat.
+- The probes refused a physical interface, a local destination and
+  a silent tunnel peer. A repeat rollout with a silent target reported
+  failure after activation and preserved private mode. Independent
+  rechecks passed on the healthy paths. In another trial the check
+  kept retrying while one TUN was absent and succeeded after it came
+  back, with both daemon invocation IDs unchanged.
