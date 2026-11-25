@@ -1057,6 +1057,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   1.72, and 1.95 s versus 4.15, 2.52, and 3.87 s with the control.
   Both runs kept their gateway and TUN interfaces, restored traffic
   in both directions, and delivered all 48 SDK messages once.
+- A gap in either the daemon event bus or the gateway's SDK
+  subscription schedules a fresh reconciliation through the existing
+  paced admission queries. The daemon uses the existing IPC Event
+  frame with the new `EVENTS_LAGGED` kind. Older clients can skip
+  the unfamiliar kind, and the gateway continues its periodic sweep
+  when a daemon lacks the notice.
+- A Unix IPC regression test overwrote a disconnect notification in
+  a full daemon event bus with an unrelated event. The gateway
+  withdrew the affected route before completing the 4,096-peer
+  sweep and restored it on a subsequent admission event. An SDK test
+  verified the bounded queue's original FIFO behavior and checked
+  that the opt-in subscription reports overflow and continues
+  delivering later events.
+- On a macOS loopback stand, the updated daemon and Veil v0.11.59
+  validated each other's private membership. The updated SDK chat
+  sample received 1,000 messages in each direction.
 
 ### Emulated inter-site link
 

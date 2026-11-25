@@ -6303,6 +6303,9 @@ pub mod event_kind {
     /// Local IPC wake hint, including replacements with an unchanged count.
     /// Empty payload. Consumers still qualify their own end-to-end route.
     pub const SESSION_ADMITTED: u8 = 7;
+    /// This IPC connection missed one or more events from the daemon.
+    /// Empty payload. Consumers can refresh the state they track.
+    pub const EVENTS_LAGGED: u8 = 8;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].

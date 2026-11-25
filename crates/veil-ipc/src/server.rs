@@ -2612,9 +2612,8 @@ async fn handle_ipc_client(
             // The arm's branch future blocks on the broadcast receiver if a
             // bus is wired, otherwise on `pending` which never resolves.
             // RecvError::Lagged signals that this slow consumer fell behind
-            // the bus capacity — surface it on stderr but keep the
-            // connection alive (the SDK just missed an intermediate state
-            // not a fatal protocol error). RecvError::Closed only fires
+            // the bus capacity. Tell the client to refresh while keeping
+            // the connection alive. RecvError::Closed only fires
             // when every Sender has dropped; treat that as "bus gone for
             // good" and stop polling that arm.
             event_recv = async {
@@ -2624,29 +2623,33 @@ async fn handle_ipc_client(
                 }
             } => {
                 idle.as_mut().reset(bump());
-                match event_recv {
-                    Ok(Some(event)) => {
-                        let body = event.encode();
-                        if write_frame_wh(
-                            &mut wh,
-                            FrameFamily::LocalApp as u8,
-                            LocalAppMsg::Event as u16,
-                            &body,
-                        ).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
+                let event = match event_recv {
+                    Ok(event) => event,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!(
                             "[veil-ipc] event subscriber lagged, dropped {n} events"
                         );
+                        Some(veil_proto::EventPayload {
+                            kind: veil_proto::event_kind::EVENTS_LAGGED,
+                            payload: Vec::new(),
+                        })
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Bus shut down; drop our handle so the arm becomes
                         // pending forever and we don't spin on closed-rx.
                         event_rx = None;
+                        None
                     }
+                };
+                if let Some(event) = event
+                    && write_frame_wh(
+                        &mut wh,
+                        FrameFamily::LocalApp as u8,
+                        LocalAppMsg::Event as u16,
+                        &event.encode(),
+                    ).await.is_err()
+                {
+                    break;
                 }
             }
 

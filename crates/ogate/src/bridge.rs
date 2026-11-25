@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 use tokio::time::Instant;
 use veil_identity::network_policy::VerifiedRoutePolicy;
-use veil_proto::event_kind::{SESSION_ADMITTED, SESSIONS_CHANGED};
+use veil_proto::event_kind::{EVENTS_LAGGED, SESSION_ADMITTED, SESSIONS_CHANGED};
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
 use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient, VeilEvent};
@@ -283,7 +283,7 @@ enum PriorityCheck {
 }
 
 struct SessionRefresh {
-    events: mpsc::Receiver<VeilEvent>,
+    events: broadcast::Receiver<VeilEvent>,
     pending: Option<Instant>,
     session_count: Option<u16>,
     pending_loss: Option<Instant>,
@@ -294,7 +294,9 @@ struct SessionRefresh {
 
 impl SessionRefresh {
     fn note_event(&mut self, event: VeilEvent) {
-        if matches!(event.kind, SESSIONS_CHANGED | SESSION_ADMITTED) {
+        if event.kind == EVENTS_LAGGED {
+            self.note_lag();
+        } else if matches!(event.kind, SESSIONS_CHANGED | SESSION_ADMITTED) {
             let due = *self
                 .pending
                 .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE);
@@ -311,6 +313,16 @@ impl SessionRefresh {
                 }
             }
         }
+    }
+
+    fn note_lag(&mut self) {
+        // Either transition could have been lost. Use the existing paced
+        // rechecks and let the next count start a fresh comparison.
+        self.session_count = None;
+        let now = Instant::now();
+        self.pending = Some(now);
+        self.pending_loss = Some(now);
+        self.pending_readmission = Some(now);
     }
 
     fn priority_check(&self, normal_due: Option<Instant>) -> Option<(Instant, PriorityCheck)> {
@@ -1670,7 +1682,7 @@ async fn maintain_routes(
         Sweep,
         Reload,
         Policy,
-        SessionEvent(Option<VeilEvent>),
+        SessionEvent(Result<VeilEvent, broadcast::error::RecvError>),
         SessionSweep,
         PrioritySweep,
     }
@@ -1678,10 +1690,12 @@ async fn maintain_routes(
         // The ordinary sweep is always ready between groups. Inspect a
         // buffered session event before selecting another group so that
         // coalescing starts promptly, even in a large table.
-        if let Some(refresh) = session_refresh.as_mut()
-            && let Ok(event) = refresh.events.try_recv()
-        {
-            refresh.note_event(event);
+        if let Some(refresh) = session_refresh.as_mut() {
+            match refresh.events.try_recv() {
+                Ok(event) => refresh.note_event(event),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => refresh.note_lag(),
+                Err(_) => {}
+            }
         }
         let batched_admission = connection
             .as_ref()
@@ -1749,12 +1763,17 @@ async fn maintain_routes(
         };
         if let Wake::SessionEvent(event) = wake {
             match event {
-                Some(event) => {
+                Ok(event) => {
                     if let Some(refresh) = session_refresh.as_mut() {
                         refresh.note_event(event);
                     }
                 }
-                None => session_refresh = None,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if let Some(refresh) = session_refresh.as_mut() {
+                        refresh.note_lag();
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => session_refresh = None,
             }
             continue;
         }
@@ -1930,7 +1949,7 @@ async fn maintain_routes(
             if let Some(client) = &connection {
                 let batched_admission = client.supports_pnet_admission_batch();
                 session_refresh = Some(SessionRefresh {
-                    events: client.events().await,
+                    events: client.events_with_lag().await,
                     pending: None,
                     session_count: None,
                     pending_loss: None,
@@ -2656,7 +2675,7 @@ mod tests {
     fn withdrawal_and_readmission_share_the_early_check_interval() {
         let now = Instant::now();
         let next = now + PNET_PRIORITY_RECHECK_SPACING;
-        let (_, events) = mpsc::channel(1);
+        let (_, events) = broadcast::channel(1);
         let mut refresh = SessionRefresh {
             events,
             pending: Some(now),
@@ -2878,6 +2897,11 @@ mod tests {
         exercise_pnet_session_rejoin(SessionHintScenario::RapidDenseWithdrawal).await;
     }
 
+    #[tokio::test]
+    async fn routes_reconcile_after_the_daemon_event_bus_drops_a_session_change() {
+        exercise_pnet_session_rejoin(SessionHintScenario::EventBusLag).await;
+    }
+
     #[test]
     fn capped_withdrawal_candidates_rotate_without_repeating_a_prefix() {
         let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
@@ -2914,6 +2938,7 @@ mod tests {
         JoinBurst,
         RapidWithdrawal,
         RapidDenseWithdrawal,
+        EventBusLag,
     }
 
     async fn exercise_pnet_session_rejoin(scenario: SessionHintScenario) {
@@ -3045,7 +3070,11 @@ mod tests {
             first_changed: SyncMutex::new(None),
             past_first_batch: Notify::new(),
         });
-        let events = Arc::new(EventBus::new());
+        let events = Arc::new(if matches!(scenario, SessionHintScenario::EventBusLag) {
+            EventBus::with_capacity(1)
+        } else {
+            EventBus::new()
+        });
         let (stop, shutdown) = watch::channel(false);
         let mut server = IpcServer::new(
             IpcEndpoint::Unix(socket.clone()),
@@ -3135,6 +3164,17 @@ mod tests {
             }),
             0
         );
+        if matches!(scenario, SessionHintScenario::EventBusLag) {
+            // The current-thread runtime cannot deliver either event until
+            // this task yields, so only the unrelated event is retained.
+            assert_ne!(
+                events.publish(EventPayload {
+                    kind: veil_proto::event_kind::MOBILE_TIER_CHANGED,
+                    payload: vec![0],
+                }),
+                0
+            );
+        }
         tokio::time::timeout(Duration::from_secs(2), async {
             while state.load().table.lookup_egress(address) != Decision::NoRoute {
                 changes.notified().await;

@@ -1006,8 +1006,7 @@ impl<T: MobileStatusProvider + ?Sized> MobileStatusProvider for std::sync::Arc<T
 /// few seconds of event burst on a slow consumer (Flutter UI in the middle of
 /// a frame paint) before the broadcast channel starts dropping the oldest
 /// items per-receiver. Lagged receivers see `RecvError::Lagged(n)` and we
-/// surface that as a single dropped event in the IPC client task — the SDK
-/// just misses an intermediate state, not a fatal error.
+/// report the gap to that IPC client so it can refresh its state.
 pub const EVENT_BUS_DEFAULT_CAPACITY: usize = 256;
 
 /// Push-event fan-out for the IPC server.

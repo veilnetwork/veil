@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 use veil_ipc::transport::{self, IpcReadHalf, IpcStream};
 use veilcore::proto::{
@@ -29,6 +29,7 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Durat
 /// reply timeout — driving the outbox to retry (duplicate live deliveries) and
 /// briefly block the UI. 12s clears the worst-case resolve with margin.
 const DHT_RESOLVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const EVENT_QUEUE_CAPACITY: usize = 1024;
 
 /// Helper for the common `tokio::oneshot::Receiver<T>` await pattern
 /// used by all RPC-shaped client methods. Folds three error cases
@@ -993,7 +994,12 @@ pub(crate) struct DispatchTable {
     /// stream out itself if multiple widgets need it. Replaced (not
     /// merged) on a second `events` call so re-subscribing after a
     /// receiver drop just works.
-    pub event_sink: Option<mpsc::Sender<VeilEvent>>,
+    event_sink: Option<EventSink>,
+}
+
+enum EventSink {
+    Queue(mpsc::Sender<VeilEvent>),
+    Broadcast(broadcast::Sender<VeilEvent>),
 }
 
 /// Per-endpoint IncomingMessage queue depth. When full the dispatcher
@@ -1072,6 +1078,20 @@ pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration:
 pub(crate) const BIND_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DispatchTable {
+    fn dispatch_event(&mut self, event: VeilEvent) {
+        let closed = match &self.event_sink {
+            Some(EventSink::Queue(tx)) => matches!(
+                tx.try_send(event),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ),
+            Some(EventSink::Broadcast(tx)) => tx.send(event).is_err(),
+            None => false,
+        };
+        if closed {
+            self.event_sink = None;
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             endpoints: Default::default(),
@@ -3044,14 +3064,22 @@ impl VeilClient {
     /// for transient consumer stalls — but bounded prevents unbounded
     /// memory growth if the consumer hangs entirely.
     ///
-    /// Dispatcher uses `try_send` (see `dispatcher_loop` event handler);
-    /// on a full channel the event is dropped and the sender is cleared
-    /// to avoid log spam. Apps reading events should keep up with the
-    /// daemon's event rate — they ARE the consumer.
+    /// The dispatcher drops new events while the channel is full.
     pub async fn events(&self) -> mpsc::Receiver<VeilEvent> {
-        let (tx, rx) = mpsc::channel(1024);
-        let mut d = self.dispatch.lock().await;
-        d.event_sink = Some(tx);
+        let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        self.dispatch.lock().await.event_sink = Some(EventSink::Queue(tx));
+        rx
+    }
+
+    /// Subscribe with notification of local queue overflow.
+    ///
+    /// As with [Self::events], this replaces an existing subscription.
+    /// A slow receiver gets `RecvError::Lagged` and can then read the
+    /// retained events. A daemon-side gap is reported as an
+    /// `EVENTS_LAGGED` event by daemons that send it.
+    pub async fn events_with_lag(&self) -> broadcast::Receiver<VeilEvent> {
+        let (tx, rx) = broadcast::channel(EVENT_QUEUE_CAPACITY);
+        self.dispatch.lock().await.event_sink = Some(EventSink::Broadcast(tx));
         rx
     }
 }
@@ -4004,22 +4032,7 @@ async fn reader_task(
                         kind: p.kind,
                         payload: p.payload,
                     };
-                    let mut d = dispatch.lock().await;
-                    let drop_sink = if let Some(tx) = d.event_sink.as_ref() {
-                        // `try_send` returns Err if either the receiver
-                        // is gone OR the channel is full. Both cases ⇒
-                        // drop the event and (if closed) clear the sender.
-                        match tx.try_send(event) {
-                            Ok(()) => false,
-                            Err(mpsc::error::TrySendError::Closed(_)) => true,
-                            Err(mpsc::error::TrySendError::Full(_)) => false,
-                        }
-                    } else {
-                        false
-                    };
-                    if drop_sink {
-                        d.event_sink = None;
-                    }
+                    dispatch.lock().await.dispatch_event(event);
                 }
             }
             LocalAppMsg::AppSendFailed => {
@@ -4035,18 +4048,7 @@ async fn reader_task(
                     kind: veilcore::proto::event_kind::ANON_SEND_FAILED,
                     payload: body.to_vec(),
                 };
-                let mut d = dispatch.lock().await;
-                let drop_sink = if let Some(tx) = d.event_sink.as_ref() {
-                    matches!(
-                        tx.try_send(event),
-                        Err(mpsc::error::TrySendError::Closed(_))
-                    )
-                } else {
-                    false
-                };
-                if drop_sink {
-                    d.event_sink = None;
-                }
+                dispatch.lock().await.dispatch_event(event);
             }
             _ => {}
         }
@@ -4233,6 +4235,52 @@ pub async fn connect_ipc_any(anchor: &Path) -> Result<IpcStream, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn event_subscriptions_keep_their_overflow_behavior() {
+        let (tx, _outgoing) = mpsc::channel(1);
+        let client = VeilClient {
+            writer: SharedWriter::new(tx),
+            dispatch: Arc::new(Mutex::new(DispatchTable::new())),
+            client_token: [0; 16],
+            reader_task: None,
+            pnet_admission_batch: false,
+            pnet_authority: None,
+        };
+        let event = |index: usize| VeilEvent {
+            kind: veil_proto::event_kind::SESSIONS_CHANGED,
+            payload: u16::try_from(index).unwrap().to_be_bytes().to_vec(),
+        };
+        let mut queue = client.events().await;
+        {
+            let mut dispatch = client.dispatch.lock().await;
+            for index in 0..=EVENT_QUEUE_CAPACITY {
+                dispatch.dispatch_event(event(index));
+            }
+        }
+        for index in 0..EVENT_QUEUE_CAPACITY {
+            assert_eq!(queue.try_recv().unwrap(), event(index));
+        }
+        assert_eq!(queue.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+        let mut events = client.events_with_lag().await;
+        assert!(queue.recv().await.is_none());
+        {
+            let mut dispatch = client.dispatch.lock().await;
+            for index in 0..=EVENT_QUEUE_CAPACITY {
+                dispatch.dispatch_event(event(index));
+            }
+        }
+        assert_eq!(
+            events.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        );
+        for index in 1..=EVENT_QUEUE_CAPACITY {
+            assert_eq!(events.try_recv().unwrap(), event(index));
+        }
+        client.dispatch.lock().await.dispatch_event(event(0));
+        assert_eq!(events.recv().await.unwrap(), event(0));
+    }
 
     #[tokio::test]
     async fn pnet_admission_batch_rejects_response_for_other_peers() {
