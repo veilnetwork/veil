@@ -929,6 +929,9 @@ impl NodeRuntime {
                             / veil_proto::budget::ROUTE_REQUEST_FORWARD_REFILL_SECS as f64,
                     ),
                 )),
+                private_miss_withdraw_budget: Arc::new(Mutex::new(
+                    veil_abuse::rate_limiter::TokenBucket::new(32.0, 16.0),
+                )),
                 unproven_ratchet_open_budget: Arc::new(Mutex::new(
                     veil_abuse::rate_limiter::TokenBucket::new(
                         veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64,

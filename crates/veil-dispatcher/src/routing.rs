@@ -491,6 +491,40 @@ impl FrameDispatcher {
         DispatchResult::NoResponse
     }
 
+    /// Retract only our own next hop, using a withdrawal that stops at ingress.
+    pub(crate) fn withdraw_private_route_from(&self, dst: NodeIdBytes, ingress: NodeIdBytes) {
+        if dst == self.local_node_id
+            || dst == ingress
+            || self.app_registry.is_peer_revoked(&ingress)
+        {
+            return;
+        }
+        let (Some(registry), Some(key)) =
+            (&self.session_tx_registry, &self.crypto.local_signing_key)
+        else {
+            return;
+        };
+        if !rlock!(registry).has_session(&ingress)
+            || !lock!(self.abuse.private_miss_withdraw_budget).allow_at(Instant::now())
+        {
+            return;
+        }
+        let mut withdrawal = RouteWithdrawPayload {
+            origin_node_id: dst,
+            via_node_id: self.local_node_id,
+            sequence: self.announce_seq.fetch_add(1, Ordering::Relaxed),
+            signature: [0u8; 64],
+            // Every existing receiver treats this as exhausted gossip budget.
+            hop_count: u8::MAX,
+        };
+        withdrawal.signature = key.sign(&withdrawal.signable_bytes()).to_bytes();
+        rlock!(registry).send_to(
+            &ingress,
+            veil_proto::header::priority::INTERACTIVE,
+            encode_routing_frame(RoutingMsg::RouteWithdraw, &withdrawal.encode()),
+        );
+    }
+
     /// Build a `RouteResponsePayload` describing this node, signed with the
     /// local Ed25519 key and including our ML-KEM EK. Honours
     /// `discovery_mode == IntroductionOnly` by clearing `transports` so the

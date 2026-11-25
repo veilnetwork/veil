@@ -1831,6 +1831,43 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   both ordinary outboxes. Draining or cancelling the write removes
   that preference. A write marked as control leaves it unchanged.
 
+#### Withdrawing a failed downstream route
+
+- The Linux ARM64 stand used two paths from `A` to `B`, each with three
+  relay nodes, and a link between their middle relays. Every edge ran on a
+  separate bridge with signed private membership. After the first relay
+  on the upper path stopped, the lower middle relay still selected the
+  upper middle relay for some traffic to `A`. An opaque frame trace
+  showed 15 of 24 sends continuing through the upper branch and stopping
+  at its last relay next to `B`.
+- On an ordinary ordered private forward with no live downstream route,
+  a relay sends the existing signed `RouteWithdraw` only to the ingress
+  peer. The receiver drops that relay's entry and keeps other paths for
+  the same destination. Scope stays on the authenticated link and signing
+  has a node-wide budget. Queue pressure does not trigger a withdrawal.
+  The regression test exercises the existing receiver and checks that
+  it keeps an alternative and sends no further withdrawal.
+- In two updated runs, exactly one unacknowledged SDK datagram took the
+  stale path after the upper relay stopped. The other 23 reached `A` over
+  the surviving lower branch, and all 24 reached `B`. In the first run
+  the next datagram arrived 201 ms after the stale path was encountered,
+  with a 200 ms send cadence. The same one-datagram loss was observed
+  with only the relay issuing the withdrawal upgraded. Its neighbour
+  used the previous build to process the withdrawal.
+- When the first relay on the lower branch stopped, the corresponding
+  detour through that branch lost one SDK datagram. The other 23 reached
+  `A` over the upper branch, and all 24 reached `B`.
+- After both `R1.1` and `R2.3` stopped, all 24 SDK datagrams per direction
+  crossed the single remaining path between `R1.2` and `R2.2`. With the
+  surviving adjacencies verified, the first arrivals took 83–109 ms from
+  the start of the probe.
+- With those two nodes already absent at startup, the first datagram
+  from `B` switched to recursive routing at `R1.3` and stopped at `R1.2`.
+  The other 23 reached `A` across the cross-link, and all 24 reached `B`.
+  First arrivals took 0.72–1.28 s from the start of the probe. These
+  measurements exercise Veil SDK delivery. A routed logical IP session
+  through `ogate` remains a separate qualification item.
+
 #### Cancelling acknowledged retries after revocation
 
 - The pending ACK tracker uses the private network's current ban list.

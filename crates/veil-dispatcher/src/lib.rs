@@ -365,6 +365,8 @@ pub struct AbuseContext {
     /// which is (admitted requests) × (peers) whoever sent them. See
     /// [`veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST`].
     pub route_request_forward_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
+    /// Node-wide bound on signing one-hop withdrawals after data-plane misses.
+    pub private_miss_withdraw_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
     /// Budget for opening ratchet payloads from senders this node has never
     /// proven.
     ///
@@ -2103,6 +2105,9 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
                         / veil_proto::budget::ROUTE_REQUEST_FORWARD_REFILL_SECS as f64,
                 ),
             )),
+            private_miss_withdraw_budget: Arc::new(Mutex::new(
+                veil_abuse::rate_limiter::TokenBucket::new(32.0, 16.0),
+            )),
             unproven_ratchet_open_budget: Arc::new(Mutex::new(
                 veil_abuse::rate_limiter::TokenBucket::new(
                     veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64,
@@ -2980,6 +2985,9 @@ mod tests {
                         veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST as f64
                             / veil_proto::budget::ROUTE_REQUEST_FORWARD_REFILL_SECS as f64,
                     ),
+                )),
+                private_miss_withdraw_budget: Arc::new(Mutex::new(
+                    veil_abuse::rate_limiter::TokenBucket::new(32.0, 16.0),
                 )),
                 unproven_ratchet_open_budget: Arc::new(Mutex::new(
                     veil_abuse::rate_limiter::TokenBucket::new(

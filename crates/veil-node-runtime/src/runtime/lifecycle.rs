@@ -12,7 +12,7 @@
 // Some imports may be unused here (the linter can prune later); we
 // favour zero-behaviour-change over a tight import set during the
 // initial split.
-use std::sync::{Arc, Mutex, atomic::AtomicU32};
+use std::sync::{Arc, Mutex};
 #[allow(unused_imports)]
 use veil_util::{lock, rlock, wlock};
 
@@ -1227,6 +1227,9 @@ impl NodeRuntime {
                 route_request_forward_budget: Arc::clone(
                     &self.dispatcher.abuse.route_request_forward_budget,
                 ),
+                private_miss_withdraw_budget: Arc::clone(
+                    &self.dispatcher.abuse.private_miss_withdraw_budget,
+                ),
                 // Reused across reloads for the same reason the others are: a
                 // reload must not hand a flooder a fresh pot.
                 unproven_ratchet_open_budget: Arc::clone(
@@ -1291,7 +1294,8 @@ impl NodeRuntime {
                 std::time::Duration::from_secs(config.routing.route_seen_window_secs),
                 config.routing.route_seen_capacity,
             ))),
-            announce_seq: Arc::new(AtomicU32::new(0)),
+            // A neighbour can retain our last announce across reload.
+            announce_seq: Arc::clone(&self.dispatcher.announce_seq),
             listen_transports: reload_listen_transports,
             // Fresh on reload: a config reload can follow a network change,
             // and stale srflx observations would advertise a dead address —

@@ -1312,6 +1312,9 @@ impl FrameDispatcher {
         // sender_node_id is preserved through the full relay chain.
         let fwd_dst = payload.envelope.recipient_node_id();
         let sender_node_id = payload.envelope.sender_node_id();
+        let private_ordered =
+            ordered && carrier.is_none() && self.app_registry.peer_revocations_enabled();
+        let mut missing_downstream = false;
         if let Some(reg) = &self.session_tx_registry {
             let dst = fwd_dst;
 
@@ -1525,6 +1528,15 @@ impl FrameDispatcher {
                     break;
                 }
             }
+            if sent_hop.is_none() && private_ordered {
+                missing_downstream = !reg_guard.has_session(&dst)
+                    && failed_hops.iter().all(|(_, error)| {
+                        matches!(
+                            error,
+                            veil_session::SendToError::Missing | veil_session::SendToError::Closed
+                        )
+                    });
+            }
             drop(reg_guard);
             invalidate_unavailable(failed_hops);
 
@@ -1549,6 +1561,22 @@ impl FrameDispatcher {
             carrier,
         ) {
             return true;
+        }
+
+        // A previous hop may still have us cached for this destination even
+        // though our own downstream path disappeared. Tell just that hop,
+        // which already knows the destination. A full queue is not a route
+        // failure, including a live sovereign recipient with a full queue.
+        if missing_downstream
+            && !self
+                .resolve_sovereign_delivery_targets(&payload.envelope.recipient)
+                .is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .any(|target| *target != self.local_node_id && target != peer_id.as_bytes())
+                })
+        {
+            self.withdraw_private_route_from(fwd_dst, *peer_id.as_bytes());
         }
 
         // Route miss — trigger on-demand discovery so the message can
@@ -3179,6 +3207,102 @@ mod tests {
             notices.try_recv(),
             Ok(AppMessage::DeliveryStage { .. })
         ));
+    }
+
+    #[test]
+    fn private_route_miss_retracts_the_stale_hop_without_touching_a_live_alternative() {
+        use crate::DispatchResult;
+        use std::sync::{Arc, RwLock, atomic::Ordering};
+        use veil_proto::{
+            codec::decode_header,
+            delivery::{DeliveryEnvelope, ForwardPayload},
+            header::HEADER_SIZE,
+            recipient::Recipient,
+        };
+        use veil_session::SessionTxRegistry;
+        use veil_util::{lock, wlock};
+
+        let mut relay = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        relay.app_registry =
+            Arc::new(veil_app::AppEndpointRegistry::new().with_peer_revocation_check(|_| false));
+        let key = ed25519_dalek::SigningKey::from_bytes(&[61; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        Arc::get_mut(&mut relay.crypto).unwrap().local_signing_key = Some(Arc::new(key));
+        relay.announce_seq.store(10, Ordering::Relaxed);
+        let local = relay.local_node_id;
+        let upstream = [62; 32];
+        let alternate = [63; 32];
+        let dst = [64; 32];
+        let mut tx = SessionTxRegistry::with_capacity(8);
+        let mut from_relay = tx.register(upstream);
+        let mut unrelated = tx.register(alternate);
+        let tx = Arc::new(RwLock::new(tx));
+        relay.session_tx_registry = Some(Arc::clone(&tx));
+        // The only remaining entry points back to the ingress, and cannot
+        // carry this frame without a routing loop.
+        wlock!(relay.route_cache).insert(dst, upstream, 10_000, 2);
+        let forward = ForwardPayload {
+            next_hop_node_id: local,
+            envelope: DeliveryEnvelope {
+                recipient: Recipient::any(dst),
+                sender_node_id: upstream,
+                src_app_id: [65; 32],
+                app_id: [66; 32],
+                endpoint_id: 0,
+                content_id: [67; 32],
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 30,
+                payload: vec![0x21; 64],
+                trace_id: 0,
+                require_ack: false,
+            },
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: None,
+        };
+        let priority = veil_proto::priority::INTERACTIVE;
+
+        // A registered downstream queue may be too full to accept the
+        // frame. In that case leave the upstream cache alone.
+        wlock!(relay.route_cache).insert(dst, alternate, 20_000, 3);
+        while rlock!(tx).send_to(&alternate, priority, vec![7]) {}
+        assert!(!relay.admit_relay_forward(&forward, upstream.into(), priority, None, 1, true));
+        assert!(from_relay.try_recv().is_err());
+        while unrelated.try_recv().is_ok() {}
+        wlock!(relay.route_cache).invalidate_hop(&dst, &alternate);
+
+        assert!(!relay.admit_relay_forward(&forward, upstream.into(), priority, None, 1, true));
+        let (_, frame) = from_relay.try_recv().expect("scoped route withdrawal");
+        assert!(
+            unrelated.try_recv().is_err(),
+            "no other neighbour is notified"
+        );
+
+        // The ordinary receiver validates the signed withdrawal and keeps
+        // all of its other paths. It need not implement the new sender logic.
+        let mut receiver = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        receiver.local_node_id = upstream;
+        let mut reverse_tx = SessionTxRegistry::new();
+        let mut outgoing = reverse_tx.register(alternate);
+        receiver.session_tx_registry = Some(Arc::new(RwLock::new(reverse_tx)));
+        lock!(receiver.crypto.peer_pubkeys).insert_lru(local, (0, public_key.to_vec()), 32);
+        let mut cache = wlock!(receiver.route_cache);
+        cache.insert(dst, local, 10_000, 2);
+        cache.insert(dst, alternate, 20_000, 3);
+        drop(cache);
+        let header = decode_header(&frame).unwrap();
+        assert!(matches!(
+            receiver.dispatch_routing(&header, &frame[HEADER_SIZE..], local.into()),
+            DispatchResult::NoResponse
+        ));
+        assert_eq!(
+            rlock!(receiver.route_cache).lookup_all(&dst),
+            vec![alternate]
+        );
+        assert!(
+            outgoing.try_recv().is_err(),
+            "the withdrawal stops at one hop"
+        );
     }
 
     #[test]
