@@ -274,6 +274,15 @@ struct SessionRefresh {
     pending: Option<Instant>,
 }
 
+impl SessionRefresh {
+    fn note_event(&mut self, event: VeilEvent) {
+        if matches!(event.kind, SESSIONS_CHANGED | SESSION_ADMITTED) {
+            self.pending
+                .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE);
+        }
+    }
+}
+
 /// Scheduling hints from the previous authenticated checks. They survive an
 /// IPC rebind, while the route table starts with no admissions on each bind.
 #[derive(Default)]
@@ -1396,27 +1405,39 @@ async fn maintain_routes(
         SessionSweep,
     }
     loop {
-        let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
+        // The ordinary sweep is always ready between groups. Inspect a
+        // buffered session event before selecting another group so that
+        // coalescing starts promptly, even in a large table.
+        if let Some(refresh) = session_refresh.as_mut()
+            && let Ok(event) = refresh.events.try_recv()
+        {
+            refresh.note_event(event);
+        }
         let multiple_batches =
             configured.peer_app_ids.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+        let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
+        let session_due_at = session_due.map(|due| due.max(next_session_sweep));
+        let may_recheck_sessions = multiple_batches || next_peer == 0;
+        let sessions_ready =
+            may_recheck_sessions && session_due_at.is_some_and(|due| due <= Instant::now());
         let wake = tokio::select! {
             _ = async {
                 if next_peer == 0 {
                     refresh.tick().await;
                 }
-            }, if config.pnet_required => Wake::Sweep,
+            }, if config.pnet_required && !sessions_ready => Wake::Sweep,
             event = async {
                 match session_refresh.as_mut() {
                     Some(refresh) => refresh.events.recv().await,
                     None => std::future::pending().await,
                 }
-            } => Wake::SessionEvent(event),
+            }, if !sessions_ready => Wake::SessionEvent(event),
             _ = async {
-                match session_due {
-                    Some(due) => tokio::time::sleep_until(due.max(next_session_sweep)).await,
+                match session_due_at {
+                    Some(due) => tokio::time::sleep_until(due).await,
                     None => std::future::pending().await,
                 }
-            }, if multiple_batches || next_peer == 0 => Wake::SessionSweep,
+            }, if may_recheck_sessions => Wake::SessionSweep,
             _ = async {
                 match hup.as_mut() {
                     Some(hup) => hup.recv().await,
@@ -1432,14 +1453,11 @@ async fn maintain_routes(
         };
         if let Wake::SessionEvent(event) = wake {
             match event {
-                Some(event) if matches!(event.kind, SESSIONS_CHANGED | SESSION_ADMITTED) => {
+                Some(event) => {
                     if let Some(refresh) = session_refresh.as_mut() {
-                        refresh
-                            .pending
-                            .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE);
+                        refresh.note_event(event);
                     }
                 }
-                Some(_) => {}
                 None => session_refresh = None,
             }
             continue;

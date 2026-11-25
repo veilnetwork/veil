@@ -9,7 +9,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
-use veil_identity::network_policy::{MAX_SIGNED_ROUTE_POLICY_BYTES, VerifiedRoutePolicy};
+use veil_identity::network_policy::{
+    MAX_SIGNED_ROUTE_POLICY_BYTES, VerifiedRoutePolicy, VerifiedRoutePolicyOffer,
+};
 use veil_proto::event_kind::SESSION_ADMITTED;
 use veil_util::unix_secs_now_u64;
 use veilclient::{
@@ -394,8 +396,7 @@ fn poll_interval(valid_until: u64, now: u64, phase: u64) -> Duration {
 
 struct Offer {
     source: NodeId,
-    verified: VerifiedRoutePolicy,
-    bytes: Vec<u8>,
+    verified: VerifiedRoutePolicyOffer,
 }
 
 #[derive(Default)]
@@ -407,11 +408,13 @@ struct Selection {
 impl Selection {
     fn consider(&mut self, offer: Offer) {
         if let Some(best) = self.best.as_ref() {
-            if offer.verified.revision < best.verified.revision {
+            let incoming = offer.verified.policy();
+            let current = best.verified.policy();
+            if incoming.revision < current.revision {
                 return;
             }
-            if offer.verified.revision == best.verified.revision {
-                self.conflict |= offer.verified != best.verified;
+            if incoming.revision == current.revision {
+                self.conflict |= incoming != current;
                 return;
             }
         }
@@ -453,19 +456,10 @@ async fn poll_mirrors(
         let policy = Arc::clone(policy);
         let remote = veil_app::address::app_id(&source, &distribution.namespace, SERVICE);
         pending.spawn(async move {
-            match timeout(
-                TRANSFER_TIMEOUT,
-                fetch_offer(&app, &policy, source, remote, revision),
-            )
-            .await
-            {
-                Ok(Ok(offer)) => offer,
-                Ok(Err(error)) => {
+            match fetch_offer(&app, policy, source, remote, revision).await {
+                Ok(offer) => offer,
+                Err(error) => {
                     tracing::debug!(%error, "P-Net policy mirror offer rejected");
-                    None
-                }
-                Err(_) => {
-                    tracing::debug!("P-Net policy mirror transfer timed out");
                     None
                 }
             }
@@ -509,7 +503,7 @@ async fn poll_mirrors(
                 !client.is_disconnected() && authorized(authority, admission, unix_secs_now_u64()),
                 "mirror's P-Net admission expired before installation"
             );
-            policy.install_offer(&offer.bytes)
+            policy.install_offer(offer.verified)
         })
         .await??;
         tracing::info!(revision, "installed P-Net route policy from mirror");
@@ -519,36 +513,39 @@ async fn poll_mirrors(
 
 async fn fetch_offer(
     app: &AppHandle,
-    policy: &SignedRoutes,
+    policy: Arc<SignedRoutes>,
     source: NodeId,
     remote: [u8; 32],
     revision: u64,
 ) -> anyhow::Result<Option<Offer>> {
-    let mut stream = app
-        .open_stream(
-            source,
-            remote,
-            ENDPOINT,
-            (MAX_SIGNED_ROUTE_POLICY_BYTES + 4) as u32,
-        )
-        .await?;
-    let mut request = [0; 12];
-    request[..4].copy_from_slice(&REQUEST_MAGIC);
-    request[4..].copy_from_slice(&revision.to_be_bytes());
-    stream.write_all(&request).await?;
-    let Some(bytes) = read_snapshot(&mut stream).await? else {
+    let bytes = timeout(TRANSFER_TIMEOUT, async {
+        let mut stream = app
+            .open_stream(
+                source,
+                remote,
+                ENDPOINT,
+                (MAX_SIGNED_ROUTE_POLICY_BYTES + 4) as u32,
+            )
+            .await?;
+        let mut request = [0; 12];
+        request[..4].copy_from_slice(&REQUEST_MAGIC);
+        request[4..].copy_from_slice(&revision.to_be_bytes());
+        stream.write_all(&request).await?;
+        read_snapshot(&mut stream).await
+    })
+    .await
+    .context("P-Net policy mirror transfer timed out")??;
+    let Some(bytes) = bytes else {
         return Ok(None);
     };
-    let verified = policy.verify_offer(&bytes)?;
+    // Keep verification scoped to this round even when a blocking worker
+    // is busy. The transfer timer cannot leave a detached verifier behind.
+    let verified = tokio::task::spawn_blocking(move || policy.verify_offer(bytes)).await??;
     ensure!(
-        verified.revision > revision,
+        verified.policy().revision > revision,
         "mirror did not supply a newer P-Net policy revision"
     );
-    Ok(Some(Offer {
-        source,
-        verified,
-        bytes,
-    }))
+    Ok(Some(Offer { source, verified }))
 }
 
 async fn read_snapshot(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<Option<Vec<u8>>> {

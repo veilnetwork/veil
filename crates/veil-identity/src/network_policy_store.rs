@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::network_policy::{
     MAX_SIGNED_ROUTE_POLICY_BYTES, RoutePolicyAuthority, RoutePolicyError, VerifiedRoutePolicy,
-    verify_route_policy,
+    VerifiedRoutePolicyOffer, verify_route_policy,
 };
 use crate::network_recovery::{
     OwnerRecovery, OwnerRecoveryError, owner_key_id, verify_owner_recovery,
@@ -38,6 +38,8 @@ pub enum StoreError {
     Rollback { offered: u64, accepted: u64 },
     #[error("route policy revision {0} has conflicting contents")]
     Conflict(u64),
+    #[error("verified route policy offer belongs to a different network or owner pin")]
+    OfferAuthorityMismatch,
     #[error("owner rotation requires a different owner key")]
     SameOwner,
     #[error("owner rotation requires a revision newer than {accepted}, offered {offered}")]
@@ -77,6 +79,12 @@ pub struct RoutePolicyStore {
 struct StoredPolicy {
     signed: Vec<u8>,
     recovery: Option<RecoveryState>,
+}
+
+struct AcceptedPolicy {
+    policy: VerifiedRoutePolicy,
+    /// Existing on-disk bytes, returned only when no write was needed.
+    retained: Option<Vec<u8>>,
 }
 
 struct RecoveryState {
@@ -212,6 +220,31 @@ impl RoutePolicyStore {
         authority: &RoutePolicyAuthority<'_>,
     ) -> Result<VerifiedRoutePolicy, StoreError> {
         let offered = verify_route_policy(blob, authority)?;
+        self.try_accept_policy(blob, authority, offered)
+            .map(|accepted| accepted.policy)
+    }
+
+    /// Accept a verified offer and return the exact durable signed bytes.
+    /// The store still checks expiry and the installed revision under its lock.
+    pub fn try_accept_offer(
+        &self,
+        offered: VerifiedRoutePolicyOffer,
+        authority: &RoutePolicyAuthority<'_>,
+    ) -> Result<(VerifiedRoutePolicy, Vec<u8>), StoreError> {
+        if !offered.matches_authority(authority) {
+            return Err(StoreError::OfferAuthorityMismatch);
+        }
+        let (policy, bytes) = offered.into_parts();
+        let accepted = self.try_accept_policy(&bytes, authority, policy)?;
+        Ok((accepted.policy, accepted.retained.unwrap_or(bytes)))
+    }
+
+    fn try_accept_policy(
+        &self,
+        blob: &[u8],
+        authority: &RoutePolicyAuthority<'_>,
+        offered: VerifiedRoutePolicy,
+    ) -> Result<AcceptedPolicy, StoreError> {
         let _lock = self.try_lock()?;
         self.accept_locked(
             blob,
@@ -400,6 +433,7 @@ impl RoutePolicyStore {
         let offered = verify_route_policy(blob, authority)?;
         let _lock = self.lock(initialize)?;
         self.accept_locked(blob, authority, offered, initialize, clock())
+            .map(|accepted| accepted.policy)
     }
 
     fn accept_locked(
@@ -409,7 +443,7 @@ impl RoutePolicyStore {
         offered: VerifiedRoutePolicy,
         initialize: bool,
         now: u64,
-    ) -> Result<VerifiedRoutePolicy, StoreError> {
+    ) -> Result<AcceptedPolicy, StoreError> {
         offered.check_current(now)?;
         let recovery = if initialize {
             let path = self.root.join(SNAPSHOT_FILE);
@@ -434,14 +468,20 @@ impl RoutePolicyStore {
                 }
                 std::cmp::Ordering::Equal => {
                     self.directory.sync_all()?;
-                    return Ok(accepted);
+                    return Ok(AcceptedPolicy {
+                        policy: accepted,
+                        retained: Some(stored.signed),
+                    });
                 }
                 std::cmp::Ordering::Greater => {}
             }
             stored.recovery
         };
         self.persist_locked(blob, recovery.as_ref())?;
-        Ok(offered)
+        Ok(AcceptedPolicy {
+            policy: offered,
+            retained: None,
+        })
     }
 
     fn persist_locked(
@@ -884,6 +924,90 @@ mod tests {
             store.try_load_signed_update(&authority, Some(&bytes)),
             Err(StoreError::Policy(RoutePolicyError::Signature(_)))
         ));
+    }
+
+    #[test]
+    fn verified_offer_checks_owner_expiry_and_the_latest_installed_revision() {
+        let dir = directory();
+        let path = dir.path().canonicalize().unwrap();
+        let key = veil_crypto::generate_keypair(ALGORITHM);
+        let another_key = veil_crypto::generate_keypair(ALGORITHM);
+        let authority = RoutePolicyAuthority {
+            network_id: NETWORK,
+            algorithm: ALGORITHM,
+            public_key: &key.public_key,
+        };
+        let another = RoutePolicyAuthority {
+            public_key: &another_key.public_key,
+            ..authority
+        };
+        let now = veil_util::unix_secs_now_u64();
+        let expiry = now + 600;
+        let first = signed(&key, 1, expiry, 2);
+        let store = RoutePolicyStore::open(&path).unwrap();
+        store.accept(&first, &authority, true).unwrap();
+
+        let foreign =
+            VerifiedRoutePolicyOffer::verify(signed(&another_key, 9, expiry, 3), &another).unwrap();
+        assert!(matches!(
+            store.try_accept_offer(foreign, &authority),
+            Err(StoreError::OfferAuthorityMismatch)
+        ));
+        let expired =
+            VerifiedRoutePolicyOffer::verify(signed(&key, 9, now - 1, 3), &authority).unwrap();
+        assert!(matches!(
+            store.try_accept_offer(expired, &authority),
+            Err(StoreError::Policy(RoutePolicyError::Expired(_)))
+        ));
+
+        let delayed =
+            VerifiedRoutePolicyOffer::verify(signed(&key, 2, expiry, 3), &authority).unwrap();
+        let latest = signed(&key, 3, expiry, 4);
+        let current = VerifiedRoutePolicyOffer::verify(latest.clone(), &authority).unwrap();
+        let (policy, persisted) = store.try_accept_offer(current, &authority).unwrap();
+        assert_eq!(policy.revision, 3);
+        assert_eq!(persisted, latest);
+        assert!(matches!(
+            store.try_accept_offer(delayed, &authority),
+            Err(StoreError::Rollback {
+                accepted: 3,
+                offered: 2
+            })
+        ));
+        assert_eq!(store.try_load_signed(&authority).unwrap().1, latest);
+    }
+
+    #[test]
+    fn equal_verified_offer_returns_the_previously_stored_signature() {
+        let dir = directory();
+        let path = dir.path().canonicalize().unwrap();
+        let algorithm = SignatureAlgorithm::Falcon512;
+        let key = veil_crypto::generate_keypair(algorithm);
+        let authority = RoutePolicyAuthority {
+            network_id: NETWORK,
+            algorithm,
+            public_key: &key.public_key,
+        };
+        let policy = RoutePolicy {
+            network_id: NETWORK,
+            revision: 1,
+            valid_from_unix: 10,
+            valid_until_unix: veil_util::unix_secs_now_u64() + 600,
+            ipv4_range: Some("198.18.0.0/24".parse().unwrap()),
+            ipv6_range: None,
+            members: Vec::new(),
+        };
+        let first = sign_route_policy(policy.clone(), algorithm, &key.public_key, &key.private_key)
+            .unwrap();
+        let resigned =
+            sign_route_policy(policy, algorithm, &key.public_key, &key.private_key).unwrap();
+        assert_ne!(first, resigned);
+        let store = RoutePolicyStore::open(&path).unwrap();
+        store.accept(&first, &authority, true).unwrap();
+        let offer = VerifiedRoutePolicyOffer::verify(resigned, &authority).unwrap();
+        let (_, durable) = store.try_accept_offer(offer, &authority).unwrap();
+        assert_eq!(durable, first);
+        assert_eq!(store.try_load_signed(&authority).unwrap().1, first);
     }
 
     #[test]

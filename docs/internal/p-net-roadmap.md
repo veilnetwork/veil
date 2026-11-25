@@ -81,17 +81,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   entries went through 16 IPC requests per sweep.
 - ogate uses the daemon's existing local session events to start admission
   sweeps earlier when it negotiates batch queries. It coalesces events
-  for 100 ms, lets any active sweep finish, and paces early sweeps based on
-  table size. The periodic sweep covers missed events and changes that
-  leave a session open. Route decisions still use the daemon's admission
-  query. In the same IPC test, a burst of 64 events took about 0.13 s to
-  withdraw 34 routes and 2.00 s to withdraw 1,024 routes. On Linux ARM64
+  for 100 ms and paces early rechecks based on table size. Between
+  batches, the bridge checks for a queued event and gives a due recheck
+  priority over the next ordinary batch. The periodic sweep covers
+  missed events and changes that leave a session open. Route decisions
+  still use the daemon's admission query. In the same IPC test, a burst
+  of 64 events took about 0.13 s to withdraw 34 routes and 2.00 s to
+  withdraw 1,024 routes. On Linux ARM64
   with a real TUN and the live peer last in a list of 1,024, route
   installation after admission took 2.12 s (previously 4.34 s). Route
   withdrawal after disconnect took 1.82 s (previously 4.34 s). The
   mixed-version run with a pre-batch daemon used the single-peer queries,
   passed traffic in both directions, and withdrew the disconnected
-  peer's route.
+  peer's route. In a separate Linux ARM64 run with 4,096 configured
+  peers, the live route returned 4.75 s after admission even though a
+  truncated peer-list reply omitted that peer. The gateway queried it
+  in the second batch and passed TUN traffic in both directions.
 - A peer-list query triggered by a session event can retry once after
   its 250 ms timeout. The retry uses the existing 125 ms query pace.
   The daemon echoes the request ID in `PeersList`, so a late reply to
@@ -1066,6 +1071,16 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   withdrew its routes when the snapshot file became group-readable.
   Restoring owner-only permissions restored bidirectional traffic on
   the same TUN interface.
+- Mirror downloads are authenticated on a blocking worker. The verified
+  offer owns its exact signed bytes and is bound to the network and
+  pinned owner. On acceptance the store checks the validity window and
+  current disk revision under its lock. It returns the durable bytes,
+  including the existing signature when an equal policy is re-signed.
+  The gateway then uses those bytes in its protected reload cache.
+- In a macOS ARM64 store comparison with 4,096 assignments and Ed25519,
+  median time for verifying an offer, committing a new revision and
+  rereading it went from 10.264 to 9.198 ms. This included the same file
+  and directory durability barriers in both paths.
 - Signed-mode ogate obtains a local IPC witness from the daemon's active
   private gate. The daemon verifies its local membership before
   advertising the network ID, owner algorithm and public-key fingerprint.
@@ -1156,6 +1171,12 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   0.831 s, with p95 of 0.820 s and mirror batches of one and thirty-one.
   The concurrent tunnel probe received all 416 ICMP replies and the
   paced TCP flow averaged 10.14 Mb/s.
+- The verified-offer path passed the same 32-subscriber workload. All
+  installed the exact signed snapshot within 0.755 s, with p95 of 0.751 s.
+  The publisher again served batches of one and thirty-one. The tunnel
+  received all 416 ICMP replies and carried the 10.14 Mb/s paced TCP
+  flow. Separate runs preserved conflict rejection and secondary mirror
+  recovery, and delivered all 48 SDK messages with the pre-batch daemon.
 - A subscriber on the previous build fetched the same maximum-size
   policy from the new mirror over obfs4 after its earlier snapshot expired.
   It kept the installed revision after the mirror banned its device.

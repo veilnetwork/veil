@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use tokio::sync::watch;
 use veil_identity::network_policy::{
-    RoutePolicyAuthority, VerifiedRoutePolicy, verify_route_policy,
+    RoutePolicyAuthority, VerifiedRoutePolicy, VerifiedRoutePolicyOffer,
 };
 use veil_identity::network_policy_store::{RoutePolicyStore, StoreError};
 use veil_util::unix_secs_now_u64;
@@ -27,7 +27,7 @@ pub(crate) struct SignedRoutes {
 struct ObservedPolicy {
     policy: Arc<VerifiedRoutePolicy>,
     /// Exact signed bytes most recently loaded for this revision and owner pin.
-    signed: Option<Arc<[u8]>>,
+    signed: Arc<[u8]>,
 }
 
 impl SignedRoutes {
@@ -62,10 +62,7 @@ impl SignedRoutes {
 
     pub fn installed_bytes(&self) -> anyhow::Result<(Arc<VerifiedRoutePolicy>, Arc<[u8]>)> {
         let observed = self.reload(false)?;
-        let bytes = observed
-            .signed
-            .ok_or_else(|| anyhow::anyhow!("signed policy bytes are unavailable"))?;
-        Ok((observed.policy, bytes))
+        Ok((observed.policy, observed.signed))
     }
 
     fn reload(&self, allow_busy_cache: bool) -> anyhow::Result<ObservedPolicy> {
@@ -74,10 +71,10 @@ impl SignedRoutes {
             .lock()
             .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
-        let previous = last.as_ref().and_then(|policy| policy.signed.as_deref());
+        let previous = last.as_ref().map(|policy| policy.signed.as_ref());
         match store.try_load_signed_update(&self.policy_authority(), previous) {
             Ok(Some((offered, bytes))) => {
-                self.observe(&mut last, offered, Some(bytes.into()))?;
+                self.observe(&mut last, offered, bytes.into())?;
             }
             Ok(None) => {}
             Err(StoreError::Busy) if allow_busy_cache => {}
@@ -86,24 +83,23 @@ impl SignedRoutes {
         last.clone().ok_or_else(|| StoreError::Busy.into())
     }
 
-    pub fn verify_offer(&self, bytes: &[u8]) -> anyhow::Result<VerifiedRoutePolicy> {
-        let offered = verify_route_policy(bytes, &self.policy_authority())?;
-        offered.check_current(unix_secs_now_u64())?;
+    pub fn verify_offer(&self, bytes: Vec<u8>) -> anyhow::Result<VerifiedRoutePolicyOffer> {
+        let offered = VerifiedRoutePolicyOffer::verify(bytes, &self.policy_authority())?;
+        offered.policy().check_current(unix_secs_now_u64())?;
         Ok(offered)
     }
 
-    pub fn install_offer(&self, bytes: &[u8]) -> anyhow::Result<u64> {
-        let verified = self.verify_offer(bytes)?;
+    pub fn install_offer(&self, offer: VerifiedRoutePolicyOffer) -> anyhow::Result<u64> {
         let mut last = self
             .last
             .lock()
             .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         if let Some(accepted) = last.as_ref() {
-            require_monotonic(&accepted.policy, &verified)?;
+            require_monotonic(&accepted.policy, offer.policy())?;
         }
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
-        let accepted = store.try_accept(bytes, &self.policy_authority())?;
-        self.observe(&mut last, accepted, None)
+        let (accepted, bytes) = store.try_accept_offer(offer, &self.policy_authority())?;
+        self.observe(&mut last, accepted, bytes.into())
     }
 
     pub fn updates(&self) -> watch::Receiver<u64> {
@@ -114,14 +110,12 @@ impl SignedRoutes {
         &self,
         last: &mut Option<ObservedPolicy>,
         offered: VerifiedRoutePolicy,
-        signed: Option<Arc<[u8]>>,
+        signed: Arc<[u8]>,
     ) -> anyhow::Result<u64> {
         if let Some(accepted) = last.as_mut() {
             require_monotonic(&accepted.policy, &offered)?;
             if offered.revision == accepted.policy.revision {
-                if signed.is_some() {
-                    accepted.signed = signed;
-                }
+                accepted.signed = signed;
                 return Ok(accepted.policy.revision);
             }
         }

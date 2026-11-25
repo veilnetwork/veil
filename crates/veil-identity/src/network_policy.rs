@@ -55,6 +55,47 @@ pub struct RoutePolicyMember {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedRoutePolicy(RoutePolicy);
 
+/// A verified offer bound to its original signed bytes and owner pin.
+#[cfg(unix)]
+pub struct VerifiedRoutePolicyOffer {
+    policy: VerifiedRoutePolicy,
+    signed: Vec<u8>,
+    owner_algorithm: SignatureAlgorithm,
+    owner_key: String,
+}
+
+#[cfg(unix)]
+impl VerifiedRoutePolicyOffer {
+    /// Authenticate the offered bytes. The store checks validity again at acceptance.
+    pub fn verify(
+        signed: Vec<u8>,
+        authority: &RoutePolicyAuthority<'_>,
+    ) -> Result<Self, RoutePolicyError> {
+        let policy = verify_route_policy(&signed, authority)?;
+        Ok(Self {
+            policy,
+            signed,
+            owner_algorithm: authority.algorithm,
+            owner_key: authority.public_key.to_owned(),
+        })
+    }
+
+    /// The authenticated policy used to compare mirror offers.
+    pub fn policy(&self) -> &VerifiedRoutePolicy {
+        &self.policy
+    }
+
+    pub(crate) fn matches_authority(&self, authority: &RoutePolicyAuthority<'_>) -> bool {
+        self.policy.network_id == authority.network_id
+            && self.owner_algorithm == authority.algorithm
+            && self.owner_key == authority.public_key
+    }
+
+    pub(crate) fn into_parts(self) -> (VerifiedRoutePolicy, Vec<u8>) {
+        (self.policy, self.signed)
+    }
+}
+
 impl std::ops::Deref for VerifiedRoutePolicy {
     type Target = RoutePolicy;
 
