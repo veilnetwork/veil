@@ -11,10 +11,11 @@ use tokio::time::Instant;
 use veil_abuse::BanList;
 use veil_dht::KademliaService;
 use veil_identity::network_access::NetworkAccessGate;
-use veil_identity::network_ban::{BAN_BLOB_MAGIC, ban_dht_key};
+use veil_identity::network_ban::BAN_BLOB_MAGIC;
 use veil_session::{SendToError, SessionOutbox, SessionTxRegistry};
 use veil_util::{lock, rlock};
 
+use super::p_net_ban_sync::enforced_ban_keys;
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
 
 const BAN_CATCH_UP_COOLDOWN: Duration = Duration::from_secs(15);
@@ -116,17 +117,8 @@ impl BanCatchUp {
         let recipients = std::mem::take(&mut self.pending).into_iter().collect();
         // Each accepted signed record creates a permanent local ban. Use
         // those IDs to address records without scanning unrelated DHT values.
-        let targets: Vec<_> = lock!(bans)
-            .manual_bans()
-            .into_iter()
-            .filter(|ban| ban.banned_until.is_none())
-            .map(|ban| ban.peer_id)
-            .collect();
         self.reconnect = BanReplicaQueue {
-            keys: targets
-                .into_iter()
-                .map(|id| ban_dht_key(network_id, &id))
-                .collect(),
+            keys: enforced_ban_keys(bans, *network_id).collect(),
             recipients,
             next_recipient: 0,
         };

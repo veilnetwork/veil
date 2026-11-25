@@ -1668,6 +1668,42 @@ impl KademliaService {
         }
     }
 
+    /// Carry live, verified P-Net bans over an in-process DHT rebuild. Only
+    /// the supplied ban keys are read, keeping unrelated private records out
+    /// of the new store and preserving the original age of each record.
+    pub fn restore_private_bans_from(
+        &self,
+        previous: &Self,
+        keys: impl IntoIterator<Item = [u8; 32]>,
+    ) -> usize {
+        let Some(gate) = &self.network_auth_gate else {
+            return 0;
+        };
+        let mut restored = 0;
+        for key in keys {
+            let now = Instant::now();
+            let entry = { lock!(previous.inner).store.peek_with_meta(&key, now) };
+            let Some(entry) = entry else {
+                continue;
+            };
+            if entry.age >= DEFAULT_TTL
+                || !entry.value.starts_with(b"PBAN")
+                || !gate.verify_ban_record(&entry.key, &entry.value)
+            {
+                continue;
+            }
+            let mut inner = lock!(self.inner);
+            if !inner.store.contains(&key)
+                && inner
+                    .store
+                    .put_restored(key, entry.value, entry.origin, entry.age, now)
+            {
+                restored += 1;
+            }
+        }
+        restored
+    }
+
     /// Remove DHT entries whose TTL has elapsed.
     ///
     /// `ttl` defaults [`DEFAULT_TTL`] when `None` is passed.
@@ -2730,6 +2766,62 @@ mod tests {
         fn peer_ids(&self) -> Vec<[u8; 32]> {
             self.peers.clone()
         }
+    }
+
+    #[test]
+    fn private_ban_reload_preserves_age_and_origin_and_rechecks_authority() {
+        struct Gate;
+        impl crate::NetworkAuthGate for Gate {
+            fn verify_ban_record(&self, _key: &[u8; 32], value: &[u8]) -> bool {
+                value == b"PBAN-valid"
+            }
+        }
+
+        let live = [1; 32];
+        let expired = [2; 32];
+        let invalid = [3; 32];
+        let unrelated = [4; 32];
+        let origin = [5; 32];
+        let previous = make_test_kademlia_service([0x0A; 32]);
+        let mut next = make_test_kademlia_service([0x0A; 32]);
+        let now = Instant::now();
+        let age = DEFAULT_TTL - Duration::from_secs(30);
+        {
+            let mut inner = lock!(previous.inner);
+            inner.store = super::super::store::TieredStore::new(1, 8);
+            assert!(
+                inner
+                    .store
+                    .put_restored(live, b"PBAN-valid".to_vec(), origin, age, now)
+            );
+            assert!(inner.store.put_restored(
+                expired,
+                b"PBAN-valid".to_vec(),
+                origin,
+                DEFAULT_TTL,
+                now
+            ));
+        }
+        previous.store_local(invalid, b"PBAN-invalid".to_vec());
+        previous.store_local(unrelated, b"unrelated".to_vec());
+
+        assert_eq!(next.restore_private_bans_from(&previous, [live]), 0);
+        next.set_network_auth_gate(Arc::new(Gate));
+        assert_eq!(
+            next.restore_private_bans_from(&previous, [live, expired, invalid]),
+            1
+        );
+        assert!(next.peek_value(&expired).is_none());
+        assert!(next.peek_value(&invalid).is_none());
+        assert!(next.peek_value(&unrelated).is_none());
+        let restored = lock!(next.inner)
+            .store
+            .peek_with_meta(&live, Instant::now())
+            .unwrap();
+        assert_eq!(restored.origin, origin);
+        assert!(restored.age >= age);
+        next.cleanup_expired(now + Duration::from_secs(31));
+        assert!(next.peek_value(&live).is_none());
     }
 
     #[tokio::test]

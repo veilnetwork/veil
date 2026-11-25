@@ -80,6 +80,21 @@ pub(super) fn guard_private_app_datagrams(
     registry.with_peer_revocation_check(move |peer| lock!(bans).is_banned(peer))
 }
 
+pub(super) fn enforced_ban_keys(
+    bans: &Mutex<BanList>,
+    network_id: [u8; 32],
+) -> impl Iterator<Item = [u8; 32]> {
+    let targets: Vec<_> = lock!(bans)
+        .manual_bans()
+        .into_iter()
+        .filter(|ban| ban.banned_until.is_none())
+        .map(|ban| ban.peer_id)
+        .collect();
+    targets
+        .into_iter()
+        .map(move |peer| ban_dht_key(&network_id, &peer))
+}
+
 /// Errors returned by [`NodeRuntime::publish_p_net_ban`].
 #[derive(Debug, thiserror::Error)]
 pub enum PublishBanError {
@@ -348,17 +363,16 @@ mod tests {
     use veil_proto::discovery::StorePayload;
     use veil_types::{MEMBERSHIP_CERT_VERSION, MembershipCert, SignatureAlgorithm};
 
-    #[tokio::test]
-    async fn publishing_a_ban_checks_the_admin_allowlist_before_effects() {
+    const TEST_NETWORK_ID: [u8; 32] = [3; 32];
+
+    fn admin_fixture(mode: veil_cfg::NetworkMode) -> (tempfile::TempDir, veil_cfg::Config) {
         use super::super::tests::runtime_config_with_listen;
         use base64::{Engine, engine::general_purpose::STANDARD};
-        use veil_cfg::{BuiltinSeedPolicy, NetworkConfig, NetworkMode, NodeRole};
+        use veil_cfg::{BuiltinSeedPolicy, NetworkConfig, NodeRole};
 
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("network.cert");
-        let config_path = dir.path().join("node.toml");
         let owner = SigningKey::from_bytes(&[1; 32]);
-        let network_id = [3; 32];
         let mut config = runtime_config_with_listen();
         config.peers.clear();
         config.global.builtin_seed_policy = BuiltinSeedPolicy::Never;
@@ -368,7 +382,7 @@ mod tests {
         let now = veil_util::unix_secs_now_u64();
         let mut cert = MembershipCert {
             version: MEMBERSHIP_CERT_VERSION,
-            network_id,
+            network_id: TEST_NETWORK_ID,
             member_node_id: local_id,
             issued_at_unix: now.saturating_sub(1),
             valid_until_unix: now + 3600,
@@ -379,13 +393,27 @@ mod tests {
         cert.owner_signature = owner.sign(&canonical_cert_body(&cert)).to_bytes().to_vec();
         std::fs::write(&cert_path, encode_cert_blob(&cert)).unwrap();
         config.network = Some(NetworkConfig {
-            mode: NetworkMode::PrivateConfigured,
-            network_id: Some(veil_util::bytes_to_hex(&network_id)),
+            mode,
+            network_id: Some(veil_util::bytes_to_hex(&TEST_NETWORK_ID)),
             owner_pubkey: Some(STANDARD.encode(owner.verifying_key().to_bytes())),
             owner_algo: Some(SignatureAlgorithm::Ed25519),
             membership_cert: Some(cert_path.to_str().unwrap().to_owned()),
             admin_node_ids: Vec::new(),
         });
+        (dir, config)
+    }
+
+    #[tokio::test]
+    async fn publishing_a_ban_checks_the_admin_allowlist_before_effects() {
+        let (dir, mut config) = admin_fixture(veil_cfg::NetworkMode::PrivateConfigured);
+        let config_path = dir.path().join("node.toml");
+        let local_id = *config
+            .identity
+            .as_ref()
+            .unwrap()
+            .node_id
+            .unwrap()
+            .as_bytes();
         for (target, allowlist, permitted) in [
             ([4; 32], vec![[9; 32]], false),
             ([5; 32], vec![local_id], true),
@@ -409,7 +437,7 @@ mod tests {
             assert_eq!(
                 runtime
                     .dht
-                    .peek_value(&ban_dht_key(&network_id, &target))
+                    .peek_value(&ban_dht_key(&TEST_NETWORK_ID, &target))
                     .is_some(),
                 permitted
             );
@@ -417,6 +445,68 @@ mod tests {
                 veil_util::rlock!(runtime.session_tx_registry).has_session(&target),
                 !permitted
             );
+            runtime.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offline_ban_survives_reload_and_reaches_a_new_session_without_disk_state() {
+        use std::time::Duration;
+        use veil_proto::family::{DiscoveryMsg, FrameFamily};
+
+        for mode in [
+            veil_cfg::NetworkMode::Private,
+            veil_cfg::NetworkMode::PrivateConfigured,
+        ] {
+            let (dir, mut config) = admin_fixture(mode);
+            let config_path = dir.path().join("node.toml");
+            config.persist_enabled = false;
+            config.dht.values_persist_path = None;
+            std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+            let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+            let target = [4; 32];
+            let key = ban_dht_key(&TEST_NETWORK_ID, &target);
+            assert_eq!(
+                runtime
+                    .publish_p_net_ban(target, "offline ban")
+                    .await
+                    .unwrap(),
+                0
+            );
+            let signed = runtime.dht.peek_value(&key).unwrap();
+            let unrelated = [19; 32];
+            runtime.dht.store_local(unrelated, vec![17]);
+
+            runtime.reload().await.unwrap();
+            assert!(lock!(runtime.ban_list).is_banned(&target));
+            assert_eq!(
+                runtime.dht.peek_value(&key).as_deref(),
+                Some(signed.as_slice())
+            );
+            assert!(runtime.dht.peek_value(&unrelated).is_none());
+
+            let peer = [5; 32];
+            let owner = [6; 32];
+            let mut rx = wlock!(runtime.session_tx_registry).register_owned(peer, owner);
+            let _request_rx = runtime.session_outbox.register_owned(peer, owner);
+            let store = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some((_, frame)) = rx.recv().await {
+                    let header = veil_proto::codec::decode_header(&frame).unwrap();
+                    if header.family == FrameFamily::Discovery as u8
+                        && header.msg_type == DiscoveryMsg::Store as u16
+                    {
+                        let store =
+                            StorePayload::decode(&frame[usize::from(header.header_len)..]).unwrap();
+                        if store.key == key {
+                            return store;
+                        }
+                    }
+                }
+                panic!("registered session closed before receiving the signed ban");
+            })
+            .await
+            .expect("new session should receive the signed ban after reloading");
+            assert_eq!(store.value, signed);
             runtime.stop().await.unwrap();
         }
     }

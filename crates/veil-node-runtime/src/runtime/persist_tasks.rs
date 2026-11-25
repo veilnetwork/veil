@@ -940,58 +940,43 @@ mod dht_values_path_tests {
     /// the async task, so every other task on the worker stopped for as long
     /// as the clone took, once every two minutes (report6 V6-H6b).
     ///
-    /// A current-thread runtime is the whole point: on one, work done in the
-    /// async task starves everything, and work handed to `spawn_blocking`
-    /// does not. The snapshot builder below blocks the thread it runs on, and
-    /// a plain async ticker beside it has to keep counting.
+    /// The builder waits for a response from the current-thread executor.
+    /// That response can arrive during the build only when the builder runs
+    /// on a different thread.
     #[tokio::test(flavor = "current_thread")]
     async fn building_a_snapshot_does_not_starve_the_runtime() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::sync::oneshot;
 
         let tasks = Arc::new(Mutex::new(RuntimeTasks::default()));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let built = Arc::new(AtomicUsize::new(0));
-        let ticks = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (progress_tx, progress_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut first_build = Some((started_tx, progress_tx));
 
-        let built_in_builder = Arc::clone(&built);
         spawn_persist_loop(
             &tasks,
             shutdown_rx,
-            std::time::Duration::from_millis(10),
+            Duration::from_millis(10),
             move || {
-                // Blocking, deliberately: this stands for the clone of a
-                // large value store.
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                built_in_builder.fetch_add(1, Ordering::SeqCst);
-                42u32
+                if let Some((started, progress)) = first_build.take() {
+                    let _ = started.send(());
+                    let _ = progress.send(release_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+                }
             },
-            |_snap: u32| {},
+            |()| {},
         );
 
-        // An ordinary async task on the same single thread.
-        let ticks_in_task = Arc::clone(&ticks);
-        let counter = tokio::spawn(async move {
-            for _ in 0..40 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                ticks_in_task.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let ticked = ticks.load(Ordering::SeqCst);
-        let snapshots = built.load(Ordering::SeqCst);
-        let _ = shutdown_tx.send(true);
-        counter.abort();
-
-        assert!(
-            snapshots >= 1,
-            "the snapshot builder never ran, so this test is about nothing",
-        );
-        assert!(
-            ticked >= 10,
-            "the async task got {ticked} turns while a snapshot was being \
-             built — the build is back on the executor, and everything else \
-             on this worker waits for it",
-        );
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("snapshot builder should start")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let progressed = progress_rx.await.unwrap();
+        shutdown_tx.send(true).unwrap();
+        let task = lock_tasks(&tasks).background.pop().unwrap();
+        task.await.unwrap();
+        assert!(progressed, "snapshot building blocked the async executor");
     }
 }

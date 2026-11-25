@@ -1696,6 +1696,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   revoked tunnel stopped in both directions. The pair spanning the old
   and new daemons received all 120 tunnel probes and 48 SDK messages
   exactly once while the ban propagated.
+- A configuration reload carries still-live signed revocations from
+  memory into the rebuilt DHT. It looks up only keys derived from the
+  local list of permanent bans. Before copying, it checks each record
+  under the active private-network gate and preserves its age and
+  store origin. The original private and provisioned private modes
+  both restored the ban and queued it to a new session in runtime tests
+  with disk persistence disabled.
+- In a five-node Linux ARM64 chain, the isolated issuer created a ban
+  with zero replicas and reloaded its configuration before the link
+  returned. Disk persistence was disabled. With `862cdb87`, the distant
+  observer still admitted the revoked peer at the 12.21 s sample after
+  reconnection. Its tunnel passed probes in both directions. With the
+  in-memory restore, the observer denied admission by the 3.27 s sample
+  and the revoked tunnel stopped in both directions. The unaffected
+  pair received all 200 tunnel probes and 48 SDK messages in each run.
 
 #### Enforcing revocations on relayed application datagrams
 

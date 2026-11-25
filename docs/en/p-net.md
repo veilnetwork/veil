@@ -195,6 +195,12 @@ allowlist. Regular DHT replication continues on its own schedule.
 `replicas_sent` counts peers for which a copy was queued. Verify receipt
 on the nodes that enforce access.
 
+`veil-cli node reload` carries live signed bans into the rebuilt DHT in
+memory, even with disk snapshots disabled. The daemon verifies each
+record under the active network trust settings and preserves its original
+DHT lifetime. After a full process restart the daemon needs a copy on disk
+or from another participant.
+
 Confirm it landed on the receiving nodes:
 ```bash
 veil-cli peers banned

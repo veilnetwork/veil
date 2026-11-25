@@ -2281,6 +2281,23 @@ impl TieredStore {
         self.cold.get(key)
     }
 
+    /// Read a single entry and its original age without promoting it.
+    pub(crate) fn peek_with_meta(&self, key: &[u8; 32], now: Instant) -> Option<StoredEntry> {
+        let (value, first_seen) = if let Some((value, _, first_seen)) = self.hot.get(key) {
+            (value.clone(), *first_seen)
+        } else {
+            let first_seen = *self.cold_first_seen.get(key)?;
+            (self.cold.get(key)?, first_seen)
+        };
+        let (origin, age) = self.entry_meta(key, first_seen, now);
+        Some(StoredEntry {
+            key: *key,
+            value,
+            origin,
+            age,
+        })
+    }
+
     /// Age-only cleanup: remove entries older than `ttl` from both tiers,
     /// WITHOUT inspecting any value (audit cycle-8). This is the DHT default
     /// path — the production caller passes a value-predicate of `|_| false`,

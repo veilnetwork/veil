@@ -759,6 +759,15 @@ impl NodeRuntime {
                     &self.session_tx_registry,
                     &self.logger,
                 );
+                let keys = super::p_net_ban_sync::enforced_ban_keys(
+                    &self.ban_list,
+                    gate.expected_network_id,
+                );
+                let restored = svc.restore_private_bans_from(&self.dht, keys);
+                if restored > 0 {
+                    self.logger
+                        .info("network.ban.reload", format!("restored={restored}"));
+                }
             }
             Arc::new(svc)
         };
@@ -865,14 +874,12 @@ impl NodeRuntime {
         // freshly-rebuilt violation tracker below.
         if self.configured_private_network.is_none() {
             *lock!(self.ban_list) = BanList::new();
-        } else {
-            // The configured private trust root is pinned across reload.
-            // Keep its live bans while repopulating the new DHT.
-            if config.persist_enabled {
-                self.restore_dht_values_snapshot(&config);
-            }
-            self.apply_stored_p_net_bans();
+        } else if config.persist_enabled {
+            // Verified live records already occupy the new DHT. Restore
+            // additional bans from the snapshot under the pinned trust root.
+            self.restore_dht_values_snapshot(&config);
         }
+        self.apply_stored_p_net_bans();
         super::persistence::load_bans(&self.ban_list, &self.config_path);
         // `.max(1)` clamp makes the `.expect` unreachable here (same
         // invariant as in `runtime/mod.rs` — see commentary there).
