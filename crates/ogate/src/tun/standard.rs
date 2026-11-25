@@ -151,10 +151,7 @@ pub struct Reader {
 impl Reader {
     /// Read the next IP packet from the device.
     ///
-    /// Allocates `mtu + headroom` per read (vs. the prior fixed 64 KiB
-    /// `vec![0u8; 65_535]`) and uses `read_buf` to elide the zero-fill —
-    /// kernel writes exactly `n` valid bytes; the uninit tail beyond `n`
-    /// is dropped by `truncate(n)` before the Vec leaves the function.
+    /// Allocates `mtu + headroom` and returns only the bytes read.
     pub async fn read_packet(&mut self) -> std::io::Result<Vec<u8>> {
         self.read_packet_with_prefix(0).await
     }
@@ -165,9 +162,8 @@ impl Reader {
     ///   [0..prefix]            zero-filled — caller overwrites these later
     ///   [prefix..prefix + n]   kernel-written IP packet bytes
     /// ```
-    /// `n` is the actual TUN read length.  The capacity beyond
-    /// `prefix + n` is dropped via `truncate`.  The returned `Vec` is fully
-    /// initialised — no caller can observe uninitialised heap bytes.
+    /// `n` is the IP packet length after stripping platform headers. The
+    /// returned `Vec` has length `prefix + n`.
     ///
     /// Use this on hot paths where the consumer (e.g. SDK
     /// `send_prepared_app_ipc_send`) wants to prepend an IPC frame header
@@ -175,19 +171,23 @@ impl Reader {
     /// then forwards the full Vec to the writer task — zero memcopies of
     /// the IP-packet body.
     pub async fn read_packet_with_prefix(&mut self, prefix: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.read_packet_into_with_prefix(prefix, &mut buf).await?;
+        Ok(buf)
+    }
+
+    /// Reuse the allocation when the caller copies the packet into a batch.
+    /// After a successful read only the zeroed prefix and current packet remain.
+    pub(crate) async fn read_packet_into_with_prefix(
+        &mut self,
+        prefix: usize,
+        buf: &mut Vec<u8>,
+    ) -> std::io::Result<()> {
         let cap = prefix + self.read_size;
-        // Audit M1: zero-initialise the whole buffer instead of `set_len`
-        // over uninitialised capacity. The previous `unsafe { set_len(cap) }`
-        // both (a) handed safe callers a `Vec` whose `[0..prefix]` bytes were
-        // uninit-from-malloc — a memory-disclosure footgun the moment any
-        // caller read/cloned/logged the prefix before filling it — and
-        // (b) constructed `&mut buf[prefix..]` over uninitialised memory to
-        // hand to `read`, which is itself unsound (a `&mut [u8]` must point at
-        // initialised bytes). Zeroing keeps the body zero-copy — the kernel
-        // `read` overwrites `[prefix..prefix+n]` in place — at the cost of one
-        // memset of an MTU-sized buffer per packet, negligible next to the
-        // per-packet AEAD/TLS work downstream.
-        let mut buf = vec![0u8; cap];
+        // Keep the read slice initialized and reset the IPC prefix. The
+        // kernel overwrites the bytes of the current packet in place.
+        buf.resize(cap, 0);
+        buf[..prefix].fill(0);
         let n = self.inner.read(&mut buf[prefix..]).await?;
         // macOS utun: drop the leading 4-byte address-family header so callers
         // see raw IP (matching the Linux IFF_NO_PI path). Shift the IP body left
@@ -206,7 +206,7 @@ impl Reader {
         {
             buf.truncate(prefix + n);
         }
-        Ok(buf)
+        Ok(())
     }
 }
 

@@ -866,6 +866,7 @@ async fn serve_link(
         tokio::spawn(async move {
             let mut tun_r = tun_r.lock().await;
             let mut batches = EgressBatches::with_ipc_prefix();
+            let mut buf = Vec::new();
             let mut routing_config = Arc::clone(&state.load().routing_config);
             let enqueue = async |config: &Arc<()>, peer_nid, peer_app_id, buf, is_batch| {
                 if !state
@@ -914,11 +915,11 @@ async fn serve_link(
                             enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                         }
                     }
-                    res = tun_r.read_packet_with_prefix(APP_IPC_SEND_PREFIX_BYTES) => match res {
+                    res = tun_r.read_packet_into_with_prefix(APP_IPC_SEND_PREFIX_BYTES, &mut buf) => match res {
                         Err(e) => {
                             return Err(BridgeError::Tun(e.into()));
                         }
-                        Ok(buf) => {
+                        Ok(()) => {
                             // `buf` layout: [reserved prefix][IP packet bytes].
                             // The PREFIX region is filled in-place by the SDK's
                             // `send_prepared` when we forward `buf` verbatim
@@ -994,7 +995,7 @@ async fn serve_link(
                                     if let Some(envelope) = batches.take_peer(&peer_nid) {
                                         enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                                     }
-                                    enqueue(&routing_config, peer_nid, peer_app_id, buf, false).await;
+                                    enqueue(&routing_config, peer_nid, peer_app_id, std::mem::take(&mut buf), false).await;
                                 } else {
                                     // Pre-flush: if appending would cross the
                                     // threshold, flush the current batch FIRST,
@@ -1017,7 +1018,7 @@ async fn serve_link(
                                 // Raw mode (E27 kill-switch off): preserve E26
                                 // wire-byte compatibility.  Zero-copy: SDK fills
                                 // PREFIX inside `buf` and forwards as-is.
-                                enqueue(&routing_config, peer_nid, peer_app_id, buf, false).await;
+                                enqueue(&routing_config, peer_nid, peer_app_id, std::mem::take(&mut buf), false).await;
                             }
                         }
                     }

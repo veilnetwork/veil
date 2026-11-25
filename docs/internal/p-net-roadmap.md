@@ -496,6 +496,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   The UDP receivers got 330,010 of 332,171 datagrams and reported 58
   local socket drops. This exercised the current direct xVeil path with
   contact consent in place at the start of bulk traffic.
+- ogate reuses its TUN read allocation between packets that are copied
+  into batches. It hands the allocation to the IPC writer for a raw
+  packet. Each successful read exposes only its zeroed IPC prefix and
+  the current packet.
+- In a Linux TCP comparison, two senders offered 32 Mb/s each through
+  the same hub, and exchanged the old and new ogate binaries for the
+  second warm sample. Together the warm samples delivered all 334,551
+  UDP datagrams and all 400 SDK chat messages. The summed sender CPU
+  across the two roughly 23-second windows per build was 1.60 s before
+  buffer reuse and 1.51 s after it. Warm chat p99 was at most 3.07 ms.
+  During the first burst, the new and old sender respectively lost
+  5,469 of 82,613 and 4,564 of 82,374 datagrams. Cold loss remains open.
+- The same ogate passed real TUN traffic both ways with an older daemon
+  and batching disabled. The current daemon's gateway withdrew the
+  route 0.878 s after the old daemon disconnected.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one

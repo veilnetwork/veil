@@ -131,18 +131,26 @@ impl Reader {
         self.read_packet_with_prefix(0).await
     }
 
-    /// Read the next IP packet into a Vec that has `prefix` uninit bytes
-    /// reserved at the start (matches `standard.rs::Reader` API so the
-    /// bridge can call `read_packet_with_prefix(APP_IPC_SEND_PREFIX_BYTES)`
-    /// uniformly across all platforms).  Audit batch 2026-05-24: added to
-    /// close the FreeBSD-specific compile-break where bridge.rs invoked a
-    /// method that did not exist on this backend.
+    /// Read the next IP packet with `prefix` zeroed bytes before its payload.
     pub async fn read_packet_with_prefix(&mut self, prefix: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.read_packet_into_with_prefix(prefix, &mut buf).await?;
+        Ok(buf)
+    }
+
+    /// Reuse the allocation when the caller copies the packet into a batch.
+    /// After a successful read only the zeroed prefix and current packet remain.
+    pub(crate) async fn read_packet_into_with_prefix(
+        &mut self,
+        prefix: usize,
+        buf: &mut Vec<u8>,
+    ) -> std::io::Result<()> {
         // 65_535 = max IP datagram size; FreeBSD `/dev/tun` returns one
         // packet per read when TUNSIFHEAD=0 (raw mode).
         const PKT_CAP: usize = 65_535;
         let total = prefix + PKT_CAP;
-        let mut buf = vec![0u8; total];
+        buf.resize(total, 0);
+        buf[..prefix].fill(0);
         loop {
             let mut guard = self.inner.readable().await?;
             let fd_raw: RawFd = self.inner.get_ref().as_raw_fd();
@@ -164,7 +172,7 @@ impl Reader {
             }) {
                 Ok(Ok(n)) => {
                     buf.truncate(prefix + n);
-                    return Ok(buf);
+                    return Ok(());
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => continue,
