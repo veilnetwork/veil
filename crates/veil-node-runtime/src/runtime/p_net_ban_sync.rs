@@ -25,7 +25,7 @@ use veil_session::SessionTxRegistry;
 use veil_types::{BAN_ENTRY_VERSION, BanEntry};
 use veil_util::{lock, wlock};
 
-use super::received_bans::{ReceivedBanSender, ReceivedBanWriter};
+use super::received_bans::{ReceivedBanSender, ReceivedBanStorage};
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
 
 /// Cap on the in-flight reason string before signing. The receiver
@@ -74,10 +74,10 @@ pub(super) fn configure_p_net_bans(
     sessions: &Arc<RwLock<SessionTxRegistry>>,
     logger: &Arc<NodeLogger>,
     received_dir: Option<PathBuf>,
-) -> Option<ReceivedBanWriter> {
-    let (received, writer) = if let Some(dir) = received_dir {
-        let (sender, writer) = ReceivedBanWriter::channel(dir, gate, logger);
-        (Some(sender), Some(writer))
+) -> Option<ReceivedBanStorage> {
+    let (received, storage) = if let Some(dir) = received_dir {
+        let (sender, storage) = ReceivedBanStorage::channel(dir, logger);
+        (Some(sender), Some(storage))
     } else {
         (None, None)
     };
@@ -88,7 +88,7 @@ pub(super) fn configure_p_net_bans(
         logger: Arc::clone(logger),
         received,
     }));
-    writer
+    storage
 }
 
 pub(super) fn guard_private_app_datagrams(
@@ -440,7 +440,11 @@ impl NodeRuntime {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
-        if let Some(writer) = self.received_ban_writer.take() {
+        if let Some(writer) = self
+            .received_ban_storage
+            .as_mut()
+            .and_then(|storage| storage.take_writer(&gate, &self.logger))
+        {
             let handle = supervised_spawn(
                 Arc::clone(&self.logger),
                 "p_net_received_ban_storage",
@@ -887,6 +891,72 @@ mod tests {
         assert!(!lock!(runtime.ban_list).is_banned(&target));
         assert!(runtime.dht.peek_value(&key).is_none());
         runtime.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_received_ban_survives_reload_without_refreshing_its_age() {
+        use std::time::Duration;
+
+        let (dir, mut config) = admin_fixture(veil_cfg::NetworkMode::PrivateConfigured);
+        let config_path = dir.path().join("node.toml");
+        let log_file = dir.path().join("daemon.log");
+        config.global.logs = veil_cfg::LogsConfig::File;
+        config.global.log_file = Some(log_file.to_string_lossy().into_owned());
+        config.persist_enabled = true;
+        config.dht.values_persist_path = Some(
+            dir.path()
+                .join("dht-values.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let store = super::super::received_bans::storage_dir(&config).unwrap();
+        let target = [18; 32];
+        let (entry, _) = signed_ban_fixture(target);
+        let key = ban_dht_key(&TEST_NETWORK_ID, &target);
+        let record = encode_ban_blob(&entry);
+        let receipt = store.join(format!("{}.pban", veil_util::bytes_to_hex(&key)));
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        std::fs::write(&store, b"temporary storage collision").unwrap();
+
+        let earliest = veil_util::unix_secs_now_u64();
+        runtime
+            .dht
+            .handle_store(StorePayload::unsigned(key, record.clone()))
+            .unwrap();
+        let latest = veil_util::unix_secs_now_u64();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while veil_util::unix_secs_now_u64() <= latest
+                || !std::fs::read_to_string(&log_file)
+                    .unwrap()
+                    .contains("network.ban.received_storage.failed")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the old writer should have a failed write before reload");
+
+        runtime.reload().await.unwrap();
+        assert!(lock!(runtime.ban_list).is_banned(&target));
+        assert_eq!(
+            runtime.dht.peek_value(&key).as_deref(),
+            Some(record.as_slice())
+        );
+        std::fs::remove_file(&store).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(6), async {
+            while !receipt.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        runtime.stop().await.unwrap();
+        outcome.expect("reload should hand the pending write to the new writer");
+
+        let bytes = std::fs::read(receipt).unwrap();
+        let received_at = u64::from_be_bytes(bytes[4..12].try_into().unwrap());
+        assert!((earliest..=latest).contains(&received_at));
+        assert_eq!(&bytes[12..], record.as_slice());
     }
 
     #[test]

@@ -217,7 +217,9 @@ local copy. The receiver can recover it from the DHT snapshot or
 another participant.
 
 `veil-cli node reload` also carries live signed bans into the rebuilt
-DHT in memory. It preserves their original DHT lifetime.
+DHT in memory. It preserves their original DHT lifetime. If received-ban
+persistence stays enabled, the replacement background writer resumes
+unfinished writes using the original receipt times.
 
 Confirm it landed on the receiving nodes:
 ```bash

@@ -1758,6 +1758,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   copy at six seconds and re-admitted the peer after restart. The
   unaffected pair delivered 200 tunnel probes and 48 SDK messages
   in each run.
+- Reload keeps the unfinished receipt metadata when the new
+  configuration still enables persistence. The replacement writer
+  uses its own DHT to check each pending signed record. Queued writes
+  become eligible for the next retry pass. A deferred write keeps its
+  deadline and backoff, and the record keeps its original receipt time.
+- In the five-node Linux ARM64 stand, an admin reload kept the ban
+  while its receiver could not write. Once storage was restored, the
+  updated receiver saved the ban by the 3.83 s sample with its source
+  still disconnected. With the ordinary DHT snapshot unavailable,
+  it restored the receipt after a `SIGKILL` and kept both tunnel
+  directions blocked. The `291e546c` control kept the ban through
+  reload, lost the pending write, and re-admitted the peer after
+  restart. Each run delivered 200 TUN probes and 48 SDK messages
+  between unaffected participants.
 
 #### Enforcing revocations on relayed application datagrams
 

@@ -752,7 +752,7 @@ impl NodeRuntime {
                 )));
             }
             if let Some(gate) = &self.network_gate {
-                self.received_ban_writer = super::p_net_ban_sync::configure_p_net_bans(
+                let received_ban_storage = super::p_net_ban_sync::configure_p_net_bans(
                     &mut svc,
                     gate,
                     &self.ban_list,
@@ -760,6 +760,12 @@ impl NodeRuntime {
                     &self.logger,
                     super::received_bans::storage_dir(&config),
                 );
+                if let (Some(next), Some(previous)) =
+                    (&received_ban_storage, &self.received_ban_storage)
+                {
+                    next.resume_from(previous);
+                }
+                self.received_ban_storage = received_ban_storage;
                 let keys = super::p_net_ban_sync::enforced_ban_keys(
                     &self.ban_list,
                     gate.expected_network_id,

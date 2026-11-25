@@ -203,20 +203,15 @@ impl ReceivedBanSender {
     }
 }
 
-pub(super) struct ReceivedBanWriter {
-    rx: mpsc::Receiver<Receipt>,
+/// Keeps receipt metadata available when a reload replaces the DHT and writer.
+pub(super) struct ReceivedBanStorage {
     dir: PathBuf,
     state: Arc<Mutex<QueueState>>,
-    gate: Arc<NetworkAccessGate>,
-    logger: Arc<NodeLogger>,
+    rx: Option<mpsc::Receiver<Receipt>>,
 }
 
-impl ReceivedBanWriter {
-    pub(super) fn channel(
-        dir: PathBuf,
-        gate: &Arc<NetworkAccessGate>,
-        logger: &Arc<NodeLogger>,
-    ) -> (ReceivedBanSender, Self) {
+impl ReceivedBanStorage {
+    pub(super) fn channel(dir: PathBuf, logger: &Arc<NodeLogger>) -> (ReceivedBanSender, Self) {
         let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let state = Arc::new(Mutex::new(QueueState::default()));
         let sender = ReceivedBanSender {
@@ -227,15 +222,62 @@ impl ReceivedBanWriter {
         (
             sender,
             Self {
-                rx,
                 dir,
                 state,
-                gate: Arc::clone(gate),
-                logger: Arc::clone(logger),
+                rx: Some(rx),
             },
         )
     }
 
+    pub(super) fn take_writer(
+        &mut self,
+        gate: &Arc<NetworkAccessGate>,
+        logger: &Arc<NodeLogger>,
+    ) -> Option<ReceivedBanWriter> {
+        Some(ReceivedBanWriter {
+            rx: self.rx.take()?,
+            dir: self.dir.clone(),
+            state: Arc::clone(&self.state),
+            gate: Arc::clone(gate),
+            logger: Arc::clone(logger),
+        })
+    }
+
+    /// Copy metadata after the previous tasks have stopped and before the
+    /// replacement DHT accepts traffic. In-flight blocking writes can still
+    /// finish against the previous state. The new writer can retry safely
+    /// against its own DHT and tolerate a copy that already reached disk.
+    pub(super) fn resume_from(&self, previous: &Self) {
+        let previous_state = lock!(previous.state);
+        let mut state = lock!(self.state);
+        let now = Instant::now();
+        let unix_now = unix_secs_now_u64();
+        for (&key, tracked) in &previous_state.known {
+            if !tracked.stamp.is_live(unix_now) {
+                continue;
+            }
+            let status = match tracked.status {
+                StorageStatus::Queued => StorageStatus::Deferred {
+                    due: now,
+                    backoff: FIRST_RETRY,
+                },
+                StorageStatus::Saved => continue,
+                status => status,
+            };
+            state.track(key, tracked.stamp, status);
+        }
+    }
+}
+
+pub(super) struct ReceivedBanWriter {
+    rx: mpsc::Receiver<Receipt>,
+    dir: PathBuf,
+    state: Arc<Mutex<QueueState>>,
+    gate: Arc<NetworkAccessGate>,
+    logger: Arc<NodeLogger>,
+}
+
+impl ReceivedBanWriter {
     pub(super) async fn run(
         mut self,
         dht: Arc<KademliaService>,
@@ -585,7 +627,8 @@ mod tests {
             admin_node_ids: Default::default(),
         });
         let logger = Arc::new(NodeLogger::new_noop());
-        let (sender, writer) = ReceivedBanWriter::channel(PathBuf::new(), &gate, &logger);
+        let (sender, mut storage) = ReceivedBanStorage::channel(PathBuf::new(), &logger);
+        let writer = storage.take_writer(&gate, &logger).unwrap();
         for i in 0..QUEUE_CAPACITY {
             let mut key = [0; 32];
             key[..2].copy_from_slice(&(i as u16).to_be_bytes());
@@ -613,6 +656,54 @@ mod tests {
         assert_eq!(retry.stamp.fingerprint, blake3::hash(b"new payload"));
         assert_eq!(retry.stamp.received_at, received_at);
         assert!(state.scheduled.is_empty());
+    }
+
+    #[test]
+    fn reload_resumes_only_live_unfinished_writes() {
+        let logger = Arc::new(NodeLogger::new_noop());
+        let (_, previous) = ReceivedBanStorage::channel(PathBuf::from("old"), &logger);
+        let (_, next) = ReceivedBanStorage::channel(PathBuf::from("new"), &logger);
+        let now = unix_secs_now_u64();
+        let stamp = ReceiptStamp {
+            received_at: now - 60,
+            fingerprint: blake3::hash(b"pending"),
+        };
+        let due = Instant::now() + MAX_RETRY;
+        {
+            let mut state = lock!(previous.state);
+            state.track([1; 32], stamp, StorageStatus::Queued);
+            state.track(
+                [2; 32],
+                stamp,
+                StorageStatus::Deferred {
+                    due,
+                    backoff: MAX_RETRY,
+                },
+            );
+            state.track([3; 32], stamp, StorageStatus::Saved);
+            state.track(
+                [4; 32],
+                ReceiptStamp {
+                    received_at: now - DEFAULT_TTL.as_secs(),
+                    ..stamp
+                },
+                StorageStatus::Queued,
+            );
+        }
+
+        next.resume_from(&previous);
+        let mut state = lock!(next.state);
+        assert_eq!(state.known.len(), 2);
+        assert!(state.scheduled.contains(&(due, [2; 32])));
+        let retries = state.take_retries(Instant::now(), now);
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].key, [1; 32]);
+        assert!(retries[0].stamp == stamp);
+        let retries = state.take_retries(due, now);
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].key, [2; 32]);
+        assert!(retries[0].stamp == stamp);
+        assert_eq!(retries[0].next_backoff, MAX_RETRY);
     }
 
     #[test]
