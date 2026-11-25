@@ -2036,6 +2036,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   arrived within 6 ms. The first branch switch protected new traffic
   while the ordered TCP connection continued draining committed bytes.
 
+#### Retrying already queued traffic during the first capacity drop
+
+- An experimental dispatcher retained at most 350 ms of recently sent
+  sealed forwards. It used the current session's pressure advisory to
+  retry the unchanged envelope once at that relay on an existing
+  alternate. The 23-second cap held the affected connection at
+  256 kbit/s while 500 UDP datagrams per second entered TUN.
+- The first variant queued 32 retries on the alternate. Both it and the
+  mirrored `19d9fdae` control delivered all 125 packets sent in the first
+  250 ms. The variant and control had 66 and 62 delays over 100 ms,
+  respectively, with maximum delays of 7.00 and 7.41 seconds. Both
+  delivered all 48 SDK messages under the cap. The TUN receiver
+  recorded zero duplicate packets in either run.
+- A variant that checked alternate readiness once before the bounded
+  retry batch sent traffic back onto the capped branch and failed the
+  concurrent SDK gate. The endpoints received 24 and 9 of their
+  expected 24 messages each by the 14-second deadline. The experiment
+  was dropped. Protecting traffic already queued before the first
+  advisory remains open.
+
 #### Recovering a branch reached through the cross-link
 
 - When `A` preferred `R2.1`, a cap on `R1.3→B` produced a
