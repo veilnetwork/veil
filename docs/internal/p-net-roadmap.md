@@ -1036,6 +1036,27 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   gateway process stayed up. Two independent UDP streams at 12 Mb/s
   each delivered all 621,832 datagrams across the six runs, and SDK
   chat delivered all 576 messages exactly once.
+- With a pre-batch daemon, the ordinary sweep checks up to eight
+  peers before processing session events and the priority work they
+  schedule. Both paths share the 125 ms request pace. The ordinary
+  snapshot interval continues to follow the size of the configured
+  table.
+- In alternating Linux ARM64 runs with 4,096 configured routes,
+  24 live sessions, and 12 restarting spokes, the eight-peer sweep
+  withdrew all affected routes in 4.54 and 5.50 s and restored them
+  in 3.38 and 4.40 s. Controls from `831c0a23` took 8.47 and
+  8.52 s to withdraw them and 8.34 and 8.58 s to restore them.
+  All four runs verified egress for each affected address and
+  bidirectional TUN traffic after recovery on the original gateway
+  process and interfaces. The two unaffected UDP streams delivered
+  all 327,280 datagrams and SDK chat delivered all 384 messages once.
+- In separate runs with no live sessions, the first sweep checked all
+  128 distinct configured peers in 16.63 s with the eight-peer sweep
+  and 16.71 s with the control. With 4,096 configured routes and one
+  late peer, first admission, withdrawal, and readmission took 1.97,
+  1.72, and 1.95 s versus 4.15, 2.52, and 3.87 s with the control.
+  Both runs kept their gateway and TUN interfaces, restored traffic
+  in both directions, and delivered all 48 SDK messages once.
 
 ### Emulated inter-site link
 

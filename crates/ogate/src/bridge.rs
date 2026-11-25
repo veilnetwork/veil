@@ -252,7 +252,10 @@ impl SharedState {
 const PNET_REFRESH_PERIOD: Duration = Duration::from_secs(5);
 const PNET_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PNET_BATCH_RETRY_AFTER: Duration = Duration::from_secs(2);
-const PNET_LEGACY_QUERY_GROUP: usize = 16;
+const PNET_LEGACY_QUERY_GROUP: usize = 8;
+// Keep the ordinary snapshot cadence independent of how often the sweep
+// yields to IPC events.
+const PNET_LEGACY_SNAPSHOT_GROUP: usize = 16;
 const PNET_LEGACY_PRIORITY_GROUP: usize = 4;
 // Daemons admit 10 local queries per second per IPC client. Leave room for
 // other local queries and avoid consuming the burst quota at startup.
@@ -1689,7 +1692,7 @@ async fn maintain_routes(
                 veilclient::PNET_ADMISSION_BATCH_MAX_PEERS,
             )
         } else {
-            (PNET_LEGACY_QUERY_GROUP, PNET_LEGACY_PRIORITY_GROUP)
+            (PNET_LEGACY_SNAPSHOT_GROUP, PNET_LEGACY_PRIORITY_GROUP)
         };
         let multiple_batches = configured.peer_app_ids.len() > group_size;
         let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
@@ -1938,7 +1941,7 @@ async fn maintain_routes(
                 let group_limit = if batched_admission {
                     veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
                 } else {
-                    PNET_LEGACY_QUERY_GROUP
+                    PNET_LEGACY_SNAPSHOT_GROUP
                 };
                 if next_peer == 0 && configured.peer_app_ids.len() > group_limit {
                     let recent = if binding.signed.is_none() {
@@ -1966,7 +1969,7 @@ async fn maintain_routes(
                                 // before pacing queries to the rest of the table.
                                 legacy_group_limit = prioritized
                                     .iter()
-                                    .take(group_limit)
+                                    .take(PNET_LEGACY_QUERY_GROUP)
                                     .take_while(|(peer, _)| hints.contains(peer))
                                     .count();
                             }
