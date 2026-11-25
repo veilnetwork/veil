@@ -639,6 +639,14 @@ and activates it one host at a time. The certificate is installed under
 a name containing its SHA-256 before the config points to it. Older
 certificate files can remain on disk.
 
+After successful activation, the playbook records the configuration
+fingerprint and current systemd invocation in a root-only file under
+`/run`. A repeat keeps Veil and the optional chat service running when
+the files are unchanged, the receipt matches the running invocation,
+and the readiness endpoint responds. Missing or stale receipts trigger
+activation, including after an interruption between file publication
+and service restart.
+
 The managed hosts need Python 3.11 or later for the TOML check and a CLI
 that supports `network check-membership`. Set `pnet_cli` to use a
 separately installed verifier. The default role settings describe the

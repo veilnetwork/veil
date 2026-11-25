@@ -1792,6 +1792,12 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   succeeded within 0.25 s and 0.19 s of the play finishing. Each pair
   received at least 1,000 SDK messages in each direction before the
   switch, after it, and after the repeat. All stand services exited.
+- The rollout now records successful activation against the systemd
+  invocation and verified config fingerprint. On Debian 12 ARM64, the
+  repeat reported no changes, preserved both Veil and chat invocations
+  and both TUN interfaces, and received all 90 tunnel replies per
+  direction alongside SDK traffic. A limited run completed a renewal
+  interrupted after file publication, restarting only the affected host.
 
 ## 9. Verify the packet path after rollout
 

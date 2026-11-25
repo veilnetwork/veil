@@ -92,6 +92,15 @@
 
     - name: Install the verified configuration
       when: pnet_apply
+      vars:
+        pnet_receipt_path: "/run/veil-pnet-{{ pnet_config | hash('sha256') }}.applied"
+        pnet_service_query:
+          - systemctl
+          - show
+          - --property=ActiveState
+          - --property=SubState
+          - --property=InvocationID
+          - veil.service
       block:
         - name: Reject changes since fleet preflight
           ansible.builtin.assert:
@@ -121,6 +130,7 @@
             owner: "{{ pnet_user }}"
             group: "{{ pnet_group }}"
             mode: "0644"
+          register: pnet_certificate_install
           diff: false
 
         - name: Publish the validated node configuration
@@ -131,30 +141,98 @@
             owner: "{{ pnet_live.stat.uid }}"
             group: "{{ pnet_live.stat.gid }}"
             mode: "{{ pnet_live.stat.mode }}"
+          register: pnet_config_install
           diff: false
           no_log: true
 
-        - name: Restart Veil with the verified configuration
-          ansible.builtin.systemd_service:
-            name: veil.service
-            state: restarted
+        - name: Check which Veil invocation is running
+          ansible.builtin.command:
+            argv: "{{ pnet_service_query }}"
+          register: pnet_running_service
+          changed_when: false
 
-        - name: Wait for Veil readiness before the next host
+        - name: Check for a receipt for the running invocation and verified configuration
+          ansible.builtin.stat:
+            path: "{{ pnet_receipt_path }}"
+            checksum_algorithm: sha256
+          register: pnet_receipt
+
+        - name: Check readiness of an already activated configuration
+          vars:
+            invocation: >-
+              {{ pnet_running_service.stdout | regex_findall('(?m)^InvocationID=([a-f0-9]{32})$') | first | default('') }}
           ansible.builtin.uri:
             url: "{{ pnet_metrics_url }}"
             status_code: 200
             use_proxy: false
             follow_redirects: none
-          register: pnet_health
-          until: pnet_health.status == 200
-          retries: 30
-          delay: 1
-
-        - name: Restart optional chat service after Veil
-          ansible.builtin.systemd_service:
-            name: chat-node.service
-            state: restarted
+            timeout: 2
+          register: pnet_running_health
           failed_when: false
+          when:
+            - not pnet_config_install.changed
+            - not pnet_certificate_install.changed
+            - "'ActiveState=active' in pnet_running_service.stdout_lines"
+            - "'SubState=running' in pnet_running_service.stdout_lines"
+            - invocation | length > 0
+            - pnet_receipt.stat.isreg | default(false)
+            - pnet_receipt.stat.uid == 0
+            - pnet_receipt.stat.mode == '0600'
+            - pnet_receipt.stat.checksum == ((invocation ~ ' ' ~ pnet_verified.candidate ~ '\n') | hash('sha256'))
+
+        - name: Activate files that are not confirmed in the running service
+          when: pnet_running_health.status | default(-1) != 200
+          block:
+            - name: Restart Veil with the verified configuration
+              ansible.builtin.systemd_service:
+                name: veil.service
+                state: restarted
+
+            - name: Wait for Veil readiness before the next host
+              ansible.builtin.uri:
+                url: "{{ pnet_metrics_url }}"
+                status_code: 200
+                use_proxy: false
+                follow_redirects: none
+              register: pnet_health
+              until: pnet_health.status == 200
+              retries: 30
+              delay: 1
+
+            - name: Restart optional chat service after Veil
+              ansible.builtin.systemd_service:
+                name: chat-node.service
+                state: restarted
+              failed_when: false
+
+            - name: Identify the ready Veil invocation
+              ansible.builtin.command:
+                argv: "{{ pnet_service_query }}"
+              register: pnet_activated_service
+              changed_when: false
+
+            - name: Confirm the configuration still matches the activated candidate
+              ansible.builtin.stat:
+                path: "{{ pnet_config }}"
+                checksum_algorithm: sha256
+              register: pnet_activated_config
+
+            - name: Record the successful activation for later runs
+              vars:
+                invocation: >-
+                  {{ pnet_activated_service.stdout | regex_findall('(?m)^InvocationID=([a-f0-9]{32})$') | first | default('') }}
+              ansible.builtin.copy:
+                dest: "{{ pnet_receipt_path }}"
+                content: "{{ invocation }} {{ pnet_verified.candidate }}\n"
+                owner: root
+                group: root
+                mode: "0600"
+              diff: false
+              when:
+                - "'ActiveState=active' in pnet_activated_service.stdout_lines"
+                - "'SubState=running' in pnet_activated_service.stdout_lines"
+                - invocation | length > 0
+                - pnet_activated_config.stat.checksum | default('') == pnet_verified.candidate
   rescue:
     - name: Record stage failure after which the rollout must halt
       ansible.builtin.set_fact:
