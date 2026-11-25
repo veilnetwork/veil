@@ -1432,6 +1432,8 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   with a per-node delay and 4–6 s minimum spacing. It leaves the
   ordinary deadline in place and permits a single in-flight round.
   A hint received during that round can also request the next poll.
+  The previous connection can supply queued hints until the
+  replacement has authenticated and subscribed.
   Each poll checks all configured mirrors and revalidates their
   admission and the signed offers.
 - Failed subscriber IPC connections retry on the same staggered 4–6 s
@@ -1457,6 +1459,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   bytes, passed bidirectional traffic on the original subscriber
   gateway and TUN interface, and delivered all 288 SDK chat messages
   exactly once.
+- In four Linux ARM64 trials, the secondary mirror joined when a
+  local proxy was holding the replacement IPC handshake. The proxy
+  forwarded admission only to the preceding policy connection.
+  The new subscriber kept that connection until the replacement was
+  ready and installed the 4,096-assignment policy after 5.33 and
+  5.45 s. Controls from `64ccda14` closed the previous connection
+  before the event and installed the policy after 14.67 and 14.72 s.
+  Separate runs on the new build installed the policy in 4.97 s
+  after a gap notice and 4.16 s after admission during the first
+  poll. All six runs installed identical signed bytes and passed
+  bidirectional traffic on the original subscriber gateway and TUN
+  interface. The SDK chat sample delivered all 288 messages once.
 
 - An isolated Linux pair recovered bidirectional TUN traffic after the
   subscriber's original snapshot expired. It fetched the full 217,260-byte

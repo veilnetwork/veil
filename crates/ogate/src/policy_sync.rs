@@ -290,28 +290,38 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
     let window = poll_interval(*expiry.borrow(), unix_secs_now_u64(), recovery);
     let jitter = Duration::from_millis(phase % window.as_millis() as u64);
     let event_delay = Duration::from_millis(SESSION_POLL_DELAY_MS + phase % SESSION_POLL_DELAY_MS);
-    let mut earliest = Instant::now();
-    let mut next = earliest + jitter;
+    let now = Instant::now();
+    let mut schedule = PollSchedule {
+        next: now + jitter,
+        earliest: now,
+        recovery,
+        event_delay,
+    };
     let mut reconnecting = false;
-    let mut mirror_hint = false;
+    let mut previous_poll: Option<(Arc<VeilClient>, broadcast::Receiver<VeilEvent>)> = None;
     while distribution.authority.is_current(unix_secs_now_u64()) {
-        // Watch on the same connection that will run the poll. Discard it
-        // after the round along with any unfinished mirror streams.
         let mut client = match distribution.connect().await {
             Ok(client) => client,
             Err(error) => {
                 tracing::debug!(%error, "P-Net policy subscriber IPC unavailable");
+                previous_poll = None;
                 reconnecting = true;
                 tokio::time::sleep(recovery).await;
                 continue;
             }
         };
-        let (wake, mut events) = wait_for_policy_poll(
+        let mut events = client.events_with_lag().await;
+        // Retire the last connection only after the replacement is watching.
+        // Its buffered events can cover joins during the poll and the IPC
+        // handshake. Only the replacement can run the next poll.
+        let mirror_hint = previous_poll.take().is_some_and(|(previous, mut events)| {
+            reconnecting |= previous.is_disconnected();
+            queued_mirror_poll_hint(&mut events)
+        });
+        let wake = wait_for_policy_poll(
             &mut client,
-            &mut next,
-            earliest,
-            recovery,
-            event_delay,
+            &mut events,
+            &mut schedule,
             reconnecting || mirror_hint,
             &mut expiry,
         )
@@ -336,21 +346,19 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
                 tracing::debug!("P-Net session event expedited mirror polling");
             }
         }
-        earliest = started + recovery;
+        schedule.earliest = started + recovery;
         let client = Arc::new(client);
         if let Err(error) = poll_mirrors(policy, distribution, &mirrors, &client).await {
             tracing::debug!(%error, "P-Net policy refresh failed");
         }
-        // The poll might have checked admission before a mirror joined.
-        // Keep hints delivered to this connection while the poll ran.
-        mirror_hint = queued_mirror_poll_hint(&mut events);
         reconnecting = client.is_disconnected();
+        previous_poll = Some((client, events));
         if periodic {
             let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), recovery);
             let now = Instant::now();
-            next = started + delay;
-            if next <= now {
-                next = now + delay;
+            schedule.next = started + delay;
+            if schedule.next <= now {
+                schedule.next = now + delay;
             }
         }
     }
@@ -362,34 +370,44 @@ enum PollWake {
     Disconnected,
 }
 
-async fn wait_for_policy_poll(
-    client: &mut VeilClient,
-    next: &mut Instant,
+struct PollSchedule {
+    next: Instant,
     earliest: Instant,
     recovery: Duration,
     event_delay: Duration,
+}
+
+async fn wait_for_policy_poll(
+    client: &mut VeilClient,
+    events: &mut broadcast::Receiver<VeilEvent>,
+    schedule: &mut PollSchedule,
     mirror_hint: bool,
     expiry: &mut watch::Receiver<u64>,
-) -> (PollWake, broadcast::Receiver<VeilEvent>) {
-    let mut events = client.events_with_lag().await;
+) -> PollWake {
+    let PollSchedule {
+        earliest,
+        recovery,
+        event_delay,
+        ..
+    } = *schedule;
     // A reconnect or an event from the previous poll can already warrant
     // an expedited round.
     let mut requested = mirror_hint.then(|| Instant::now() + event_delay);
-    advance_poll_for_expiry(next, expiry, recovery);
+    advance_poll_for_expiry(&mut schedule.next, expiry, recovery);
     let mut listen = true;
     loop {
-        let periodic = (*next).max(earliest);
+        let periodic = schedule.next.max(earliest);
         let due = requested
             .and_then(|requested| expedited_poll(requested, earliest, periodic, recovery))
             .unwrap_or(periodic);
         tokio::select! {
-            _ = client.wait_disconnected() => return (PollWake::Disconnected, events),
-            _ = sleep_until(due) => return (if due == periodic {
+            _ = client.wait_disconnected() => return PollWake::Disconnected,
+            _ = sleep_until(due) => return if due == periodic {
                 PollWake::Periodic
             } else {
                 PollWake::Expedited
-            }, events),
-            Ok(()) = expiry.changed() => advance_poll_for_expiry(next, expiry, recovery),
+            },
+            Ok(()) = expiry.changed() => advance_poll_for_expiry(&mut schedule.next, expiry, recovery),
             event = events.recv(), if listen => match event {
                 Ok(event) if is_mirror_poll_hint(&event) => {
                     requested.get_or_insert_with(|| Instant::now() + event_delay);
@@ -409,7 +427,7 @@ fn is_mirror_poll_hint(event: &VeilEvent) -> bool {
 }
 
 fn queued_mirror_poll_hint(events: &mut broadcast::Receiver<VeilEvent>) -> bool {
-    // Consider only the backlog observed when the poll ended.
+    // Consider only the backlog observed at handoff.
     (0..events.len()).any(|_| match events.try_recv() {
         Ok(event) => is_mirror_poll_hint(&event),
         Err(broadcast::error::TryRecvError::Lagged(_)) => true,
@@ -761,10 +779,16 @@ mod tests {
         .await
         .unwrap();
         let mut client = VeilClient::connect(&socket).await.unwrap();
+        let mut events = client.events_with_lag().await;
         let now = Instant::now();
         let earliest = now + Duration::from_millis(100);
         let periodic = now + Duration::from_secs(10);
-        let mut next = periodic;
+        let mut schedule = PollSchedule {
+            next: periodic,
+            earliest,
+            recovery: recovery_interval(0),
+            event_delay: Duration::from_millis(5),
+        };
         let (_snapshot, mut expiry) = watch::channel(u64::MAX);
         let publish = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -778,19 +802,12 @@ mod tests {
                 );
             }
         };
-        let wait = wait_for_policy_poll(
-            &mut client,
-            &mut next,
-            earliest,
-            recovery_interval(0),
-            Duration::from_millis(5),
-            false,
-            &mut expiry,
-        );
+        let wait =
+            wait_for_policy_poll(&mut client, &mut events, &mut schedule, false, &mut expiry);
         let (result, ()) = tokio::join!(timeout(Duration::from_secs(2), wait), publish);
-        assert!(matches!(result.unwrap().0, PollWake::Expedited));
+        assert!(matches!(result.unwrap(), PollWake::Expedited));
         assert!(Instant::now() >= earliest);
-        assert_eq!(next, periodic);
+        assert_eq!(schedule.next, periodic);
         drop(client);
         stop.send(true).unwrap();
         server.await.unwrap();
