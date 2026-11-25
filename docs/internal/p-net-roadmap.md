@@ -287,6 +287,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   departures, then resumes the sweep at the same cursor. The batch uses
   the existing query pace and retry deadline. At the session list's cap,
   the full sweep continues to check peers missing from the list.
+- On a sparsely populated gateway, session changes use indexed routing
+  lookups for the affected peers. Candidate ordering still puts possible
+  departures before joins, and the existing batch limit, IPC pace, and
+  admission rules apply. Dense tables keep the original selection path.
+- In an optimized macOS ARM64 microbenchmark with 4,096 configured routes,
+  selection with 48 live sessions took a median 1.0 µs with no changes
+  and 1.3 µs with six withdrawals and six joins, compared with 107.8
+  and 107.2 µs before. A 256-entry capped session list took 6.7 µs
+  versus 20.4 µs. With 1,024 admitted peers, the dense path took about
+  5.1 µs in both variants. These timings measure candidate selection
+  in memory.
+- Two Linux ARM64 gateways with 4,096 configured routes each passed
+  bidirectional TUN traffic after a late join, with the route added
+  within 0.32 s of observing admission. A separate two-gateway run
+  withdrew the route 5.26 s after detecting session loss. Bidirectional
+  traffic resumed on the original TUN interfaces 2.47 s after observing
+  readmission. With a pre-batch daemon and 34 configured routes, the
+  equivalent intervals were 0.88 s for withdrawal and 6.63 s for
+  bidirectional recovery. Both disconnect runs delivered all 48 SDK
+  chat messages exactly once before the restart.
 - A matched Linux run reused the daemon, 48 authenticated identities and
   24 disjoint tables of 4,096 entries. Spokes initiated the sessions so
   their restarts could exercise route recovery without waiting for the

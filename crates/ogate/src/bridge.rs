@@ -389,6 +389,11 @@ impl LivePeerHints {
         admitted: &HashMap<NodeId, u64>,
     ) -> Vec<(NodeId, [u8; 32])> {
         let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+        let candidates = self.ids.len() + if self.at_capacity { 0 } else { admitted.len() };
+        if candidates <= configured.len() / 8 {
+            return self.sparse_changed_peers(configured, admitted, limit);
+        }
+
         let mut changed = Vec::new();
         // Recheck potentially stale routes ahead of new joins. A full
         // snapshot can omit live peers, so leave those absences to the sweep.
@@ -409,6 +414,43 @@ impl LivePeerHints {
                 .take(limit - changed.len()),
         );
         changed
+    }
+
+    fn sparse_changed_peers(
+        &self,
+        configured: &[(NodeId, [u8; 32])],
+        admitted: &HashMap<NodeId, u64>,
+        limit: usize,
+    ) -> Vec<(NodeId, [u8; 32])> {
+        // Configured routes are sorted by NodeId. For a sparsely populated
+        // gateway, look up just the observed changes instead of scanning all
+        // configured peers. Preserve the sweep's ordering within each group.
+        let lookup = |peer: &NodeId| configured.binary_search_by_key(peer, |(id, _)| *id).ok();
+        let mut indices = Vec::new();
+        if !self.at_capacity {
+            indices.extend(
+                admitted
+                    .keys()
+                    .filter(|peer| !self.ids.contains(*peer))
+                    .filter_map(lookup),
+            );
+            indices.sort_unstable();
+        }
+        if indices.len() < limit {
+            let joins_start = indices.len();
+            indices.extend(
+                self.ids
+                    .iter()
+                    .filter(|peer| !admitted.contains_key(*peer))
+                    .filter_map(lookup),
+            );
+            indices[joins_start..].sort_unstable();
+        }
+        indices
+            .into_iter()
+            .take(limit)
+            .map(|index| configured[index])
+            .collect()
     }
 }
 
@@ -2219,6 +2261,42 @@ mod tests {
             &reassigned.routing_config,
             &previous.routing_config
         ));
+    }
+
+    #[test]
+    fn sparse_session_hints_match_dense_order_and_respect_a_full_snapshot() {
+        fn id(index: u16) -> NodeId {
+            let mut id = [0; 32];
+            id[..2].copy_from_slice(&index.to_be_bytes());
+            id
+        }
+
+        let configured: Vec<_> = (0..4096).map(|index| (id(index), [17; 32])).collect();
+        // All of the changes fit inside this prefix. Using this prefix alone
+        // selects the dense path while the full table selects the sparse path.
+        let dense = &configured[..256];
+        let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+        let admitted: HashMap<_, _> = (100..104)
+            .chain(160..220)
+            .chain([5000])
+            .map(|index| (id(index), 0))
+            .collect();
+        let live: HashSet<_> = (0..90).chain(160..220).chain([5100]).map(id).collect();
+        for at_capacity in [false, true] {
+            let hints = LivePeerHints {
+                ids: live.clone(),
+                at_capacity,
+            };
+            let sparse = hints.changed_peers(&configured, &admitted);
+            assert_eq!(sparse, hints.changed_peers(dense, &admitted));
+            let withdrawn = if at_capacity { 100..100 } else { 100..104 };
+            let expected: Vec<_> = withdrawn
+                .chain(0..90)
+                .take(limit)
+                .map(|index| (id(index), [17; 32]))
+                .collect();
+            assert_eq!(sparse, expected);
+        }
     }
 
     #[test]
