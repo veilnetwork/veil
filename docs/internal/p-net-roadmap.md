@@ -1521,7 +1521,8 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   the installed revision in force. Unchanged snapshots send only a length
   frame; large downloads and simultaneous requests have fixed bounds.
 - A subscriber watches for admitted-session events on its local polling
-  connection. An event or a reported gap can advance the next poll,
+  connection. Targeted admission of a configured mirror, a generic
+  admission event or a reported gap can advance the next poll,
   with a per-node delay and 4–6 s minimum spacing. It leaves the
   ordinary deadline in place and permits a single in-flight round.
   A hint received during that round can also request the next poll.
@@ -1529,6 +1530,13 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   replacement has authenticated and subscribed.
   Each poll checks all configured mirrors and revalidates their
   admission and the signed offers.
+- A paired three-node Linux ARM64 run admitted an ordinary private
+  member after the first poll. The control ran one extra poll before
+  the regular deadline. The candidate ran zero. After the configured
+  mirror restarted with revision 2, the candidate installed the exact
+  signed 4,096-assignment snapshot in 3.639 s after observed admission.
+  The control took 3.796 s. The subscriber kept its original TUN and
+  SDK messages went in both directions.
 - Failed subscriber IPC connections retry on the same staggered 4–6 s
   cadence. Reconnecting can trigger one early poll under the same
   spacing rule, including when the daemon admitted a mirror while the

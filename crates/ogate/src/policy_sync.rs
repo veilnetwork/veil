@@ -340,12 +340,13 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
         // handshake. Only the replacement can run the next poll.
         let mirror_hint = previous_poll.take().is_some_and(|(previous, mut events)| {
             reconnecting |= previous.is_disconnected();
-            queued_mirror_poll_hint(&mut events)
+            queued_mirror_poll_hint(&mut events, &mirrors)
         });
         let wake = wait_for_policy_poll(
             &mut client,
             &mut events,
             &mut schedule,
+            &mirrors,
             reconnecting || mirror_hint,
             &mut expiry,
         )
@@ -405,6 +406,7 @@ async fn wait_for_policy_poll(
     client: &mut VeilClient,
     events: &mut broadcast::Receiver<VeilEvent>,
     schedule: &mut PollSchedule,
+    mirrors: &[NodeId],
     mirror_hint: bool,
     expiry: &mut watch::Receiver<u64>,
 ) -> PollWake {
@@ -433,7 +435,7 @@ async fn wait_for_policy_poll(
             },
             Ok(()) = expiry.changed() => advance_poll_for_expiry(&mut schedule.next, expiry, recovery),
             event = events.recv(), if listen => match event {
-                Ok(event) if is_mirror_poll_hint(&event) => {
+                Ok(event) if is_mirror_poll_hint(&event, mirrors) => {
                     requested.get_or_insert_with(|| Instant::now() + event_delay);
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -446,17 +448,23 @@ async fn wait_for_policy_poll(
     }
 }
 
-fn is_mirror_poll_hint(event: &VeilEvent) -> bool {
-    matches!(
-        event.kind,
-        SESSION_ADMITTED | PNET_SESSION_ADMITTED | EVENTS_LAGGED
-    )
+fn is_mirror_poll_hint(event: &VeilEvent, mirrors: &[NodeId]) -> bool {
+    match event.kind {
+        SESSION_ADMITTED | EVENTS_LAGGED => true,
+        PNET_SESSION_ADMITTED => mirrors
+            .iter()
+            .any(|peer| event.payload.as_slice() == peer.as_slice()),
+        _ => false,
+    }
 }
 
-fn queued_mirror_poll_hint(events: &mut broadcast::Receiver<VeilEvent>) -> bool {
+fn queued_mirror_poll_hint(
+    events: &mut broadcast::Receiver<VeilEvent>,
+    mirrors: &[NodeId],
+) -> bool {
     // Consider only the backlog observed at handoff.
     (0..events.len()).any(|_| match events.try_recv() {
-        Ok(event) => is_mirror_poll_hint(&event),
+        Ok(event) => is_mirror_poll_hint(&event, mirrors),
         Err(broadcast::error::TryRecvError::Lagged(_)) => true,
         Err(_) => false,
     })
@@ -896,8 +904,14 @@ mod tests {
                 );
             }
         };
-        let wait =
-            wait_for_policy_poll(&mut client, &mut events, &mut schedule, false, &mut expiry);
+        let wait = wait_for_policy_poll(
+            &mut client,
+            &mut events,
+            &mut schedule,
+            &[[7; 32]],
+            false,
+            &mut expiry,
+        );
         let (result, ()) = tokio::join!(timeout(Duration::from_secs(2), wait), publish);
         assert!(matches!(result.unwrap(), PollWake::Expedited));
         assert!(Instant::now() >= earliest);
@@ -910,27 +924,37 @@ mod tests {
     #[test]
     fn notifications_queued_during_a_poll_can_request_the_next_poll() {
         let (publish, mut events) = broadcast::channel(2);
+        let mirrors = [[7; 32]];
         let event = |kind| VeilEvent {
             kind,
             payload: Vec::new(),
         };
         let other = veil_proto::event_kind::MAILBOX_WAKE;
         publish.send(event(other)).unwrap();
-        assert!(!queued_mirror_poll_hint(&mut events));
+        assert!(!queued_mirror_poll_hint(&mut events, &mirrors));
+        for payload in [vec![9; 32], vec![7; 31]] {
+            publish
+                .send(VeilEvent {
+                    kind: PNET_SESSION_ADMITTED,
+                    payload,
+                })
+                .unwrap();
+            assert!(!queued_mirror_poll_hint(&mut events, &mirrors));
+        }
         publish.send(event(other)).unwrap();
         publish.send(event(SESSION_ADMITTED)).unwrap();
-        assert!(queued_mirror_poll_hint(&mut events));
+        assert!(queued_mirror_poll_hint(&mut events, &mirrors));
         publish
             .send(VeilEvent {
                 kind: PNET_SESSION_ADMITTED,
                 payload: vec![7; 32],
             })
             .unwrap();
-        assert!(queued_mirror_poll_hint(&mut events));
+        assert!(queued_mirror_poll_hint(&mut events, &mirrors));
         for kind in [SESSION_ADMITTED, other, other] {
             publish.send(event(kind)).unwrap();
         }
-        assert!(queued_mirror_poll_hint(&mut events));
+        assert!(queued_mirror_poll_hint(&mut events, &mirrors));
     }
 
     #[test]

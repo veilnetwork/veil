@@ -497,6 +497,9 @@ round at a time. If its local daemon connection fails, the receiver
 retries that connection every 4–6 seconds. After reconnecting it can
 check the configured publishers early when there is time for a
 separate check before the regular poll.
+Admission of a configured publisher can also advance the next poll.
+The receiver can request an early poll on a generic admission event
+from an older daemon or a reported event gap.
 
 Each side requires current daemon-certified membership. A receiver
 verifies the owner's signature, validity and revision before storing
