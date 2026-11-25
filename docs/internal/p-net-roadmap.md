@@ -525,6 +525,24 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   accepting its rate, job and byte budgets. Rejected sends skip these
   clones. The handler still uses the timestamp captured before the
   budget checks to calculate its deadline.
+- In the first 24-gateway Linux TCP pair with that change, the same
+  ogate binary carried two 32 Mb/s UDP flows. The control lost 1,629
+  of 166,154 datagrams. The deferred-context daemon lost 3,849 of
+  166,710. The source IPC refusals accounted for 1,555 and 3,464 missing
+  datagrams respectively. Receiving sockets counted the remaining 74
+  and 385. Both runs delivered all 200 SDK chat messages. Chat p99
+  towards the hub was 182 ms on the control and 402 ms with the change.
+- The reverse-order pair lost 13,363 of 164,627 datagrams on the
+  control and 9,241 of 164,932 with the change. It delivered all 200
+  chat messages in both trials, with p99 towards the hub of 401 and
+  391 ms respectively. Total sender daemon CPU moved from 4.52 to
+  4.99 s in the first pair and from 4.83 to 4.31 s in the repeat. The
+  differences in loss, latency and CPU changed direction between pairs.
+- Queue, rate and local source rejections use a contiguous stack buffer
+  for the two-byte send error. `SERVER_BUSY` writes the header and the
+  code through one `write_all` call. The bytes and request ID match the
+  existing IPC response format. Rate and source-identity errors retain
+  their legacy zero request ID.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one

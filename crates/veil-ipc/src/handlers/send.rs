@@ -1123,14 +1123,7 @@ pub(crate) async fn rate_limited(
     if let Some(rl) = rate_limiter
         && !rl.allow()
     {
-        let err_code = ipc_send_err::RATE_LIMITED.to_be_bytes();
-        let mut hdr = FrameHeader::new(
-            FrameFamily::LocalApp as u8,
-            LocalAppMsg::AppSendFailed as u16,
-        );
-        hdr.body_len = 2;
-        let mut frame = codec::encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&err_code);
+        let frame = crate::frame_io::encode_send_error(0, ipc_send_err::RATE_LIMITED);
         wh.write_all(&frame).await?;
         return Ok(true);
     }
@@ -3144,13 +3137,7 @@ async fn handle_ipc_send_inner(
 /// and after this fix.  Honoring `require_ack=false` halves the IPC
 /// syscall count per send and frees enough budget to push pps higher.
 async fn app_send_error(sink: &mut SendReply<'_>, code: u16) -> std::io::Result<()> {
-    let mut header = FrameHeader::new(
-        FrameFamily::LocalApp as u8,
-        LocalAppMsg::AppSendFailed as u16,
-    );
-    header.body_len = 2;
-    let mut frame = codec::encode_header(&header).to_vec();
-    frame.extend_from_slice(&code.to_be_bytes());
+    let frame = crate::frame_io::encode_send_error(0, code);
     sink.write_all(&frame).await
 }
 

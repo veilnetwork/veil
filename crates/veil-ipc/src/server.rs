@@ -2735,13 +2735,7 @@ async fn handle_ipc_client(
                             crate::route_trace::sealed_local_sample(
                                 "source_refused", veil_proto::ipc::ipc_local_source_lane(&hdr), &body,
                             );
-                            let mut hdr = FrameHeader::new(
-                                FrameFamily::LocalApp as u8,
-                                LocalAppMsg::AppSendFailed as u16,
-                            );
-                            hdr.body_len = 2;
-                            let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-                            frame.extend_from_slice(&ipc_send_err::SPOOFED_SRC.to_be_bytes());
+                            let frame = crate::frame_io::encode_send_error(0, ipc_send_err::SPOOFED_SRC);
                             wh.write_all(&frame).await?;
                         } else {
                             let source_received_at = std::time::Instant::now();
@@ -2783,11 +2777,10 @@ async fn handle_ipc_client(
                                         if let Some(metrics) = &client_state.metrics {
                                             metrics.inc_ipc_send_admission_rejected(limit);
                                         }
-                                        crate::frame_io::write_frame_wh_id(
-                                            &mut wh, FrameFamily::LocalApp as u8,
-                                            LocalAppMsg::AppSendFailed as u16, hdr.request_id,
-                                            &veil_proto::ipc::ipc_send_err::SERVER_BUSY.to_be_bytes(),
-                                        ).await?;
+                                        let frame = crate::frame_io::encode_send_error(
+                                            hdr.request_id, ipc_send_err::SERVER_BUSY,
+                                        );
+                                        wh.write_all(&frame).await?;
                                         continue;
                                     }
                                 };
@@ -3173,11 +3166,7 @@ async fn handle_ipc_client(
                             crate::route_trace::sealed_rt_local_sample(
                                 "source_refused", hdr.priority(), &body,
                             );
-                            let err_code = ipc_send_err::SPOOFED_SRC.to_be_bytes();
-                            let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendFailed as u16);
-                            hdr.body_len = 2;
-                            let mut frame = codec::encode_header(&hdr).to_vec();
-                            frame.extend_from_slice(&err_code);
+                            let frame = crate::frame_io::encode_send_error(0, ipc_send_err::SPOOFED_SRC);
                             wh.write_all(&frame).await?;
                         } else {
                             handle_rt_send(

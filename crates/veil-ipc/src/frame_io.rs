@@ -14,7 +14,7 @@
 
 use crate::transport::{IpcReadHalf, IpcStream, IpcWriteHalf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use veil_proto::{FrameFamily, FrameHeader, codec};
+use veil_proto::{FrameFamily, FrameHeader, HEADER_SIZE, LocalAppMsg, codec};
 
 /// Build a complete IPC OVL1 frame (`LocalApp` family) from a `msg_type` and
 /// `body` bytes, allocating from the global buffer pool.
@@ -220,6 +220,38 @@ pub(crate) fn encode_reply_frame_id(msg_type: u16, request_id: u32, body: &[u8])
     frame.extend_from_slice(&hdr_buf);
     frame.extend_from_slice(body);
     frame
+}
+
+/// Encode a send rejection into a stack buffer for a single IPC write.
+pub(crate) fn encode_send_error(request_id: u32, code: u16) -> [u8; HEADER_SIZE + 2] {
+    let mut header = FrameHeader::new(
+        FrameFamily::LocalApp as u8,
+        LocalAppMsg::AppSendFailed as u16,
+    );
+    header.request_id = request_id;
+    header.body_len = 2;
+    let mut frame = [0; HEADER_SIZE + 2];
+    frame[..HEADER_SIZE].copy_from_slice(&codec::encode_header(&header));
+    frame[HEADER_SIZE..].copy_from_slice(&code.to_be_bytes());
+    frame
+}
+
+#[cfg(test)]
+#[test]
+fn send_error_preserves_legacy_and_correlated_reply_bytes() {
+    use veil_proto::ipc::ipc_send_err;
+
+    for (request_id, code) in [
+        (0, ipc_send_err::RATE_LIMITED),
+        (0x1020_3040, ipc_send_err::SERVER_BUSY),
+    ] {
+        let expected = encode_reply_frame_id(
+            LocalAppMsg::AppSendFailed as u16,
+            request_id,
+            &code.to_be_bytes(),
+        );
+        assert_eq!(encode_send_error(request_id, code).as_slice(), expected);
+    }
 }
 
 /// Encode and write a framed message to a non-split `IpcStream`.
