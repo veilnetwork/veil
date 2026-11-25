@@ -16,6 +16,17 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   daemon's burst allowance. Verify that
   plain open mode and authorized source-IP checks retain their behavior.
 
+- `ogate` checks the daemon's sender authentication result before it
+  processes an app certificate or writes an IP packet to TUN. This applies
+  to both raw packets and batch envelopes. The regression test submits
+  the same node ID with and without proof and checks that only authenticated
+  origins pass. In two Linux ARM64 runs, real TUN interfaces each returned
+  16 IPv4 and 16 IPv6 replies per direction. One run used batch envelopes
+  and verified app certificates at both ends. The other used raw packets
+  and paired the current daemon with the previous daemon, which had no
+  batch admission support. The SDK exchanged all 48 test messages in each
+  run.
+
 ## 2. Qualify mixed versions and load
 
 - Run a private stand with the current daemon and the previous release.

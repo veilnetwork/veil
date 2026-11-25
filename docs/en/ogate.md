@@ -408,13 +408,12 @@ The current test network runs `mode=authorized` over `192.168.0.0/16`:
   over 100,000 small messages a second on Linux, so if anything is the
   bottleneck it's far more likely the daemon's crypto or the network
   itself than `ogate`.
-* **Authorization** happens in `ogate` itself, as packets arrive. In
-  `authorized` mode every incoming packet is checked twice: that its
-  `src_node_id` is in the peer table, AND that its `src_ip` matches
-  `peers[src_node_id].addr_*`.
-* **Anti-spoofing**: because of that second check, in `authorized` mode
-  a peer can't slip in packets pretending to come from a virtual IP that
-  isn't theirs.
+* **Sender authentication** uses the origin proof provided by the local
+  Veil daemon. `ogate` discards unverified origins before processing app
+  certificates, individual IP packets, or batches.
+* **Authorization** in `authorized` mode checks that the verified
+  `src_node_id` is in the peer table and that each packet's `src_ip`
+  matches `peers[src_node_id].addr_*`.
 
 ## Limitations and open work
 

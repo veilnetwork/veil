@@ -9,6 +9,7 @@ pub(crate) enum DropReason {
     EgressOversize,
     EgressQueuedRoute,
     EgressIpcFrame,
+    IngressUnauthenticatedFrame,
     IngressAppCertFrame,
     IngressOversize,
     IngressExpired,
@@ -17,7 +18,7 @@ pub(crate) enum DropReason {
     IngressTunWrite,
 }
 
-const REASONS: [(DropReason, &str); 12] = [
+const REASONS: [(DropReason, &str); 13] = [
     (DropReason::EgressInvalidIp, "egress_invalid_ip"),
     (DropReason::EgressNoRoute, "egress_no_active_route"),
     (DropReason::EgressAdmission, "egress_admission_unavailable"),
@@ -27,6 +28,10 @@ const REASONS: [(DropReason, &str); 12] = [
         "egress_queued_route_unavailable",
     ),
     (DropReason::EgressIpcFrame, "egress_ipc_submit_error_frames"),
+    (
+        DropReason::IngressUnauthenticatedFrame,
+        "ingress_unauthenticated_frames",
+    ),
     (
         DropReason::IngressAppCertFrame,
         "ingress_app_cert_denied_frames",

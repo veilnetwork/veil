@@ -36,7 +36,9 @@ use veil_proto::event_kind::{
 };
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
-use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient, VeilEvent};
+use veilclient::{
+    APP_IPC_SEND_PREFIX_BYTES, AppHandle, IncomingMessage, PnetAuthority, VeilClient, VeilEvent,
+};
 
 use crate::app_id::{derive_app_id, namespace_for};
 use crate::batch::{BatchIter, EgressBatches, is_batch_envelope};
@@ -1658,6 +1660,11 @@ async fn serve_link(
                         break;
                     }
                     Ok(Some(im)) => {
+                        let Some(sender) =
+                            authenticated_ingress_sender(&im, packet_drops.as_deref())
+                        else {
+                            continue;
+                        };
                         // S2.B: cert message intercept BEFORE any IP-packet
                         // dispatch.  Marker 0xC0 is outside IPv4/IPv6 version
                         // nibbles + distinct from batch envelope (0xB1).
@@ -1665,18 +1672,18 @@ async fn serve_link(
                             match crate::cert_message::decode_cert_message(&im.data) {
                                 Ok(blob) => {
                                     if let Some(gate) = app_cert_gate_for_ingress.as_ref() {
-                                        match gate.verify(&blob, &im.src_node_id) {
+                                        match gate.verify(&blob, sender) {
                                             Ok(valid_until) => {
-                                                verified_peers.insert(im.src_node_id, valid_until);
+                                                verified_peers.insert(*sender, valid_until);
                                                 tracing::info!(
-                                                    src = %hex::encode(im.src_node_id),
+                                                    src = %hex::encode(sender),
                                                     valid_until,
                                                     "app-cert verified for peer"
                                                 );
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
-                                                    src = %hex::encode(im.src_node_id),
+                                                    src = %hex::encode(sender),
                                                     error = %e,
                                                     "app-cert verify failed; ignoring"
                                                 );
@@ -1686,14 +1693,14 @@ async fn serve_link(
                                         // Gate not configured — silently swallow the
                                         // cert message (wire-compat for mixed deployment).
                                         tracing::debug!(
-                                            src = %hex::encode(im.src_node_id),
+                                            src = %hex::encode(sender),
                                             "ignoring unsolicited cert (gate not configured)"
                                         );
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        src = %hex::encode(im.src_node_id),
+                                        src = %hex::encode(sender),
                                         error = e,
                                         "malformed cert message"
                                     );
@@ -1709,7 +1716,7 @@ async fn serve_link(
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs())
                                     .unwrap_or(0);
-                                match verified_peers.get(&im.src_node_id) {
+                                match verified_peers.get(sender) {
                                     Some(0) => true, // sentinel: no expiry
                                     Some(&exp) if exp > now => true,
                                     _ => false,
@@ -1721,7 +1728,7 @@ async fn serve_link(
                                     DropReason::IngressAppCertFrame,
                                 );
                                 tracing::debug!(
-                                    src = %hex::encode(im.src_node_id),
+                                    src = %hex::encode(sender),
                                     "app-cert gate: dropping packet from unverified peer"
                                 );
                                 continue;
@@ -1735,7 +1742,7 @@ async fn serve_link(
                                 deliver_one(
                                     &mut tun_w,
                                     &state,
-                                    &im.src_node_id,
+                                    sender,
                                     pkt,
                                     packet_drops.as_deref(),
                                 )
@@ -1749,7 +1756,7 @@ async fn serve_link(
                             if im.data.len() > mtu as usize {
                                 record_one(packet_drops.as_deref(), DropReason::IngressOversize);
                                 tracing::debug!(
-                                    src = %hex::encode(im.src_node_id),
+                                    src = %hex::encode(sender),
                                     len = im.data.len(),
                                     mtu,
                                     "ingress: dropping oversize packet",
@@ -1759,7 +1766,7 @@ async fn serve_link(
                             deliver_one(
                                 &mut tun_w,
                                 &state,
-                                &im.src_node_id,
+                                sender,
                                 &im.data,
                                 packet_drops.as_deref(),
                             )
@@ -2555,6 +2562,20 @@ async fn maintain_routes(
     }
 }
 
+/// The daemon supplies both the claimed node ID and its proof of origin.
+/// Check the proof before either updating app-cert state or parsing IP data.
+fn authenticated_ingress_sender<'a>(
+    message: &'a IncomingMessage,
+    packet_drops: Option<&PacketDrops>,
+) -> Option<&'a NodeId> {
+    if message.provenance.is_authenticated() {
+        return Some(&message.src_node_id);
+    }
+    record_one(packet_drops, DropReason::IngressUnauthenticatedFrame);
+    tracing::debug!("ingress: dropping a frame with unverified origin");
+    None
+}
+
 /// Per-packet ingress delivery: route lookup + MTU check + TUN write.
 ///
 /// Shared between the legacy single-packet path and the batched-envelope
@@ -2669,6 +2690,32 @@ mod tests {
     use super::*;
     use crate::config::{AccessMode, PeerEntry};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn ingress_uses_the_daemons_origin_proof_for_the_same_node_id() {
+        use veilclient::SenderProvenance;
+
+        let mut message = IncomingMessage {
+            src_node_id: [0xaa; 32],
+            provenance: SenderProvenance::Claimed,
+            src_app_id: [0x19; 32],
+            data: Vec::new(),
+            reply_id: 0,
+            src_device: None,
+        };
+        assert!(authenticated_ingress_sender(&message, None).is_none());
+        for provenance in [
+            SenderProvenance::SessionPeer,
+            SenderProvenance::Signed,
+            SenderProvenance::LocalIpc,
+        ] {
+            message.provenance = provenance;
+            assert_eq!(
+                authenticated_ingress_sender(&message, None),
+                Some(&[0xaa; 32])
+            );
+        }
+    }
 
     fn cfg() -> OgateConfig {
         OgateConfig {
