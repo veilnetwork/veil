@@ -1,5 +1,5 @@
 //! Exercise terminal and ordinary writer shutdown through the real runner.
-use super::super::{OwnedWriter, SessionRunner, WireBlob, writer_task};
+use super::super::{OwnedWriter, SessionRunner, WireBlob, WriterFeedback, writer_task};
 use super::reliable_source_pressure_quic_tests::make_runner;
 use std::{
     path::PathBuf,
@@ -196,8 +196,7 @@ async fn ordinary_writer_shutdown_still_drains_the_accepted_blob() {
         write,
         rx,
         None,
-        None,
-        None,
+        WriterFeedback::default(),
         None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),

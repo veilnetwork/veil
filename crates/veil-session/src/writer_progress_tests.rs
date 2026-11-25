@@ -1,4 +1,4 @@
-use super::write_with_progress_timeout;
+use super::{WriterFeedback, write_with_progress_timeout};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -67,8 +67,7 @@ async fn failed_writer_releases_without_shutdown(fail_flush: bool) {
         write,
         rx,
         None,
-        None,
-        None,
+        WriterFeedback::default(),
         None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),
@@ -197,8 +196,10 @@ async fn ordered_writer_pressure_guides_private_relays_with_empty_outboxes() {
         write,
         rx,
         None,
-        None,
-        Some(Arc::clone(&relay_status)),
+        WriterFeedback {
+            relay_status: Some(Arc::clone(&relay_status)),
+            ..WriterFeedback::default()
+        },
         None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "private-relay-fixture".into(),
@@ -301,8 +302,10 @@ async fn stalled_primary_preserves_bytes(buffered: bool) {
         write,
         rx,
         None,
-        Some(Arc::clone(&source)),
-        None,
+        WriterFeedback {
+            source: Some(Arc::clone(&source)),
+            ..WriterFeedback::default()
+        },
         None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),
@@ -383,8 +386,10 @@ async fn stalled_neutral_writer_does_not_claim_primary_pressure() {
         write,
         rx,
         None,
-        Some(Arc::clone(&source)),
-        None,
+        WriterFeedback {
+            source: Some(Arc::clone(&source)),
+            ..WriterFeedback::default()
+        },
         None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),

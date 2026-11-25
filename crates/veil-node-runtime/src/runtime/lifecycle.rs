@@ -276,9 +276,7 @@ impl NodeRuntime {
     }
 
     fn pending_received_ban_flush(&self) -> Option<impl Future<Output = ()> + use<>> {
-        if self.shutdown_tx.is_none() {
-            return None;
-        }
+        self.shutdown_tx.as_ref()?;
         let storage = self.received_ban_storage.as_ref()?;
         Some(storage.flush_at_stop(
             Arc::clone(&self.dht),

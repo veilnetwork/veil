@@ -1707,6 +1707,12 @@ fn local_control_write(priority: u8, frame: &[u8]) -> bool {
             && decode_realtime_lane_frame(frame).is_none())
 }
 
+#[derive(Default)]
+struct WriterFeedback {
+    source: Option<Arc<local_primary_write::PrimaryWriteState>>,
+    relay_status: Option<Arc<crate::local_datagram_status::LocalDatagramStatus>>,
+}
+
 /// writer task — owns the `WriteHalf<BoxIoStream>` and
 /// drains pre-encrypted/pre-coalesced wire bytes pushed onto it from
 /// the runner's main loop. Each `write_all` is wrapped in a
@@ -1728,8 +1734,10 @@ async fn writer_task<B: Into<WireBlob>>(
     mut write_half: tokio::io::WriteHalf<BoxIoStream>,
     mut wire_rx: mpsc::Receiver<B>,
     admission: Option<Arc<local_reliable_admission::ReliableWriteAdmission>>,
-    source: Option<Arc<local_primary_write::PrimaryWriteState>>,
-    relay_status: Option<Arc<crate::local_datagram_status::LocalDatagramStatus>>,
+    WriterFeedback {
+        source,
+        relay_status,
+    }: WriterFeedback,
     metrics: Option<Arc<NodeMetrics>>,
     logger: Arc<NodeLogger>,
     peer_id_short: String,
@@ -1945,8 +1953,7 @@ pub fn spawn_writer_task(
         write_half,
         wire_rx,
         None,
-        None,
-        None,
+        WriterFeedback::default(),
         metrics,
         logger,
         peer_id_short,
@@ -4551,8 +4558,10 @@ impl SessionRunner {
                     .as_ref()
                     .map(|feedback| feedback.writer_admission())
             }),
-            writer_source.clone(),
-            relay_status.cloned(),
+            WriterFeedback {
+                source: writer_source.clone(),
+                relay_status: relay_status.cloned(),
+            },
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
@@ -7253,8 +7262,10 @@ impl SessionRunner {
             new_write,
             new_rx,
             None,
-            source,
-            relay_status,
+            WriterFeedback {
+                source,
+                relay_status,
+            },
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
