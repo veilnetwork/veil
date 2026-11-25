@@ -587,6 +587,18 @@ pub trait PnetStatusProvider: Send + Sync {
         None
     }
 
+    /// Whether this provider can verify an explicit certificate against the
+    /// same authority and bans as its sessions.
+    fn supports_member_verification(&self) -> bool {
+        false
+    }
+
+    /// Verify a certificate without admitting a peer or mutating session state.
+    /// Called on a bounded blocking worker, outside the IPC connection loop.
+    fn verify_member(&self, _member_node_id: &[u8; 32], _certificate: &[u8]) -> Option<u64> {
+        None
+    }
+
     /// Look up the P-Net admission status for a given peer.
     /// Implementation contract:
     /// * Echo `peer_node_id` back in the result for IPC pipeline-safety.
@@ -615,6 +627,14 @@ pub trait PnetStatusProvider: Send + Sync {
 impl<T: PnetStatusProvider + ?Sized> PnetStatusProvider for std::sync::Arc<T> {
     fn authority(&self) -> Option<veil_proto::ipc::PnetAuthority> {
         (**self).authority()
+    }
+
+    fn supports_member_verification(&self) -> bool {
+        (**self).supports_member_verification()
+    }
+
+    fn verify_member(&self, member_node_id: &[u8; 32], certificate: &[u8]) -> Option<u64> {
+        (**self).verify_member(member_node_id, certificate)
     }
 
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> veil_proto::PnetStatusResultPayload {

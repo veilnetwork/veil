@@ -2407,6 +2407,14 @@ async fn handle_ipc_client(
     if pnet_admission_batch {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH;
     }
+    let pnet_member_verification = authority.is_some()
+        && hello.flags & veil_proto::ipc::IPC_CAP_PNET_MEMBER_VERIFICATION != 0
+        && pnet_status_queries
+            .as_ref()
+            .is_some_and(|queries| queries.supports_member_verification());
+    if pnet_member_verification {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_PNET_MEMBER_VERIFICATION;
+    }
     if stream_write_credit {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT;
     }
@@ -3692,6 +3700,13 @@ async fn handle_ipc_client(
                     Ok(LocalAppMsg::PnetAdmissionBatchQuery) if pnet_admission_batch => {
                         if let Some(queries) = &pnet_status_queries {
                             queries.queue_admission_batch(
+                                hdr.request_id, &body, &mut client_state, &spawn_sem, &reply_tx,
+                            );
+                        }
+                    }
+                    Ok(LocalAppMsg::VerifyPnetMember) if pnet_member_verification => {
+                        if let Some(queries) = &pnet_status_queries {
+                            queries.queue_member_verification(
                                 hdr.request_id, &body, &mut client_state, &spawn_sem, &reply_tx,
                             );
                         }

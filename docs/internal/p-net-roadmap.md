@@ -27,6 +27,24 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   batch admission support. The SDK exchanged all 48 test messages in each
   run.
 
+### Verifying a member without a direct session
+
+- Authority-aware IPC clients can negotiate `VerifyPnetMember`. The node
+  checks the presented certificate against its active P-Net owner, checks
+  the member ID and current bans, and bounds the result by both certificate
+  lifetimes. It uses bounded workers and its own verification budget. A
+  successful check leaves the session and direct admission caches untouched.
+- A loopback daemon verified a certificate for an offline member. Its
+  direct status still reported no admission. A certificate for another
+  network or member was rejected, and a live ban took effect on the next
+  query. The previous daemon completed the existing local IPC handshake
+  without advertising certificate verification.
+- For a routed IP peer, verify possession of the certified identity and
+  current bidirectional reachability with a fresh challenge over the
+  authenticated app path. Bind the route to that proof and withdraw it on
+  expiry or loss of admission. Keep the direct status query for existing
+  callers and negotiate routed admission separately.
+
 ## 2. Qualify mixed versions and load
 
 - Run a private stand with the current daemon and the previous release.

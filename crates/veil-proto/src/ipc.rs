@@ -62,6 +62,10 @@ pub const IPC_CAP_PNET_AUTHORITY: u32 = 128;
 pub const IPC_HELLO_OK_PNET_AUTHORITY: u16 = 0x4000;
 /// Request peer identifiers on private-session events over local IPC.
 pub const IPC_CAP_PNET_SESSION_HINTS: u32 = 256;
+/// Request local validation of an owner-signed membership certificate.
+pub const IPC_CAP_PNET_MEMBER_VERIFICATION: u32 = 512;
+/// HELLO_OK acknowledgment for the local certificate verification query.
+pub const IPC_HELLO_OK_PNET_MEMBER_VERIFICATION: u16 = 0x8000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PnetTrustRoot {
@@ -6517,6 +6521,36 @@ impl PnetAdmission {
         Some(Self {
             peer_node_id: bytes[..32].try_into().ok()?,
             valid_until_unix,
+        })
+    }
+}
+
+/// A verdict on the supplied certificate. This says nothing about the
+/// member's possession of its identity key or availability over the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PnetMemberVerification {
+    pub member_node_id: [u8; 32],
+    /// The earlier expiry of both the local and presented certificates.
+    /// `None` is a rejection and `Some(0)` means neither certificate expires.
+    pub valid_until_unix: Option<u64>,
+}
+
+impl PnetMemberVerification {
+    pub const WIRE_SIZE: usize = PnetAdmission::WIRE_SIZE;
+
+    pub fn encode(self) -> [u8; Self::WIRE_SIZE] {
+        PnetAdmission {
+            peer_node_id: self.member_node_id,
+            valid_until_unix: self.valid_until_unix,
+        }
+        .encode()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let entry = PnetAdmission::decode(bytes.try_into().ok()?)?;
+        Some(Self {
+            member_node_id: entry.peer_node_id,
+            valid_until_unix: entry.valid_until_unix,
         })
     }
 }

@@ -70,6 +70,86 @@ async fn start_server(sock: PathBuf) -> (watch::Sender<bool>, tokio::task::JoinH
 }
 
 #[tokio::test]
+async fn pnet_member_verification_is_negotiated_and_separate_from_session_status() {
+    use veil_ipc::PnetStatusProvider;
+    use veil_proto::PnetStatusResultPayload;
+    use veilclient::VeilClient;
+
+    struct Verification;
+    impl PnetStatusProvider for Verification {
+        fn authority(&self) -> Option<veilclient::PnetAuthority> {
+            Some(veilclient::PnetAuthority {
+                root: veilclient::PnetTrustRoot::from_owner(
+                    [1; 32],
+                    veil_types::SignatureAlgorithm::Ed25519,
+                    &[2; 32],
+                ),
+                local_valid_until_unix: 0,
+            })
+        }
+
+        fn supports_member_verification(&self) -> bool {
+            true
+        }
+
+        fn verify_member(&self, member: &[u8; 32], certificate: &[u8]) -> Option<u64> {
+            (member == &[3; 32] && certificate == b"test certificate").then_some(0)
+        }
+
+        fn peer_status(&self, peer: &[u8; 32]) -> PnetStatusResultPayload {
+            PnetStatusResultPayload {
+                peer_node_id: *peer,
+                admitted: false,
+                has_cert: false,
+                admin: false,
+                valid_until_unix: 0,
+                network_id: [0; 32],
+            }
+        }
+    }
+
+    let socket = temp_socket();
+    let (stop, shutdown) = watch::channel(false);
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(socket.clone()),
+        shutdown,
+        Arc::new(AppEndpointRegistry::new()),
+        node_id(),
+    )
+    .with_pnet_status_provider(Arc::new(Verification));
+    let task = tokio::spawn(async move { server.run().await.unwrap() });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let regular = VeilClient::connect(&socket).await.unwrap();
+    assert!(!regular.supports_pnet_member_verification());
+    let client = VeilClient::connect_with_pnet_authority(&socket)
+        .await
+        .unwrap();
+    assert!(client.supports_pnet_member_verification());
+    let (accepted, rejected) = tokio::join!(
+        client.verify_pnet_member(&[3; 32], b"test certificate"),
+        client.verify_pnet_member(&[4; 32], b"test certificate"),
+    );
+    assert_eq!(accepted.unwrap(), Some(0));
+    assert_eq!(rejected.unwrap(), None);
+    assert!(!client.peer_pnet_status(&[3; 32]).await.unwrap().admitted);
+
+    drop(client);
+    drop(regular);
+    stop.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn pnet_authority_is_available_only_on_an_opt_in_ipc_connection() {
     struct Provider(veilclient::PnetAuthority);
     impl veil_ipc::PnetStatusProvider for Provider {

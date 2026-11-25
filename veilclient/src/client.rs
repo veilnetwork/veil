@@ -823,9 +823,14 @@ type PendingPnetAdmissionBatch = (
     u32,
     tokio::sync::oneshot::Sender<Result<Vec<crate::PnetAdmission>, ClientError>>,
 );
+type PendingPnetMemberVerification = (
+    u32,
+    tokio::sync::oneshot::Sender<Result<veil_proto::ipc::PnetMemberVerification, ClientError>>,
+);
 
 pub struct VeilClient {
     pnet_admission_batch: bool,
+    pnet_member_verification: bool,
     pnet_authority: Option<crate::PnetAuthority>,
     /// Shared write half — cloned by each `AppHandle`.
     pub(crate) writer: SharedWriter,
@@ -890,6 +895,7 @@ pub(crate) struct DispatchTable {
     pub pending_pnet_status:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PnetStatus>)>,
     pending_pnet_admission_batches: std::collections::VecDeque<PendingPnetAdmissionBatch>,
+    pending_pnet_member_verifications: std::collections::VecDeque<PendingPnetMemberVerification>,
     pub pending_local_preparation: std::collections::VecDeque<(
         u32,
         tokio::sync::oneshot::Sender<Option<veil_proto::ipc::LocalDatagramChannelState>>,
@@ -1104,6 +1110,7 @@ impl DispatchTable {
             pending_peers_list: std::collections::VecDeque::new(),
             pending_pnet_status: std::collections::VecDeque::new(),
             pending_pnet_admission_batches: std::collections::VecDeque::new(),
+            pending_pnet_member_verifications: std::collections::VecDeque::new(),
             pending_local_preparation: std::collections::VecDeque::new(),
             pending_listen_transports: std::collections::VecDeque::new(),
             pending_attempt_hole_punch: std::collections::VecDeque::new(),
@@ -1164,7 +1171,8 @@ impl VeilClient {
     ) -> Result<Self, ClientError> {
         Self::connect_inner(
             socket_path.as_ref(),
-            veil_proto::ipc::IPC_CAP_PNET_AUTHORITY,
+            veil_proto::ipc::IPC_CAP_PNET_AUTHORITY
+                | veil_proto::ipc::IPC_CAP_PNET_MEMBER_VERIFICATION,
         )
         .await
     }
@@ -1177,7 +1185,8 @@ impl VeilClient {
     ) -> Result<Self, ClientError> {
         let mut flags = veil_proto::ipc::IPC_CAP_PNET_SESSION_HINTS;
         if request_authority {
-            flags |= veil_proto::ipc::IPC_CAP_PNET_AUTHORITY;
+            flags |= veil_proto::ipc::IPC_CAP_PNET_AUTHORITY
+                | veil_proto::ipc::IPC_CAP_PNET_MEMBER_VERIFICATION;
         }
         Self::connect_inner(socket_path.as_ref(), flags).await
     }
@@ -1313,6 +1322,9 @@ impl VeilClient {
             client_token: ok.client_token,
             pnet_admission_batch: hdr.flags & veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH
                 != 0,
+            pnet_member_verification: pnet_authority.is_some()
+                && extra_flags & veil_proto::ipc::IPC_CAP_PNET_MEMBER_VERIFICATION != 0
+                && hdr.flags & veil_proto::ipc::IPC_HELLO_OK_PNET_MEMBER_VERIFICATION != 0,
             pnet_authority,
             pnet_status_reader,
             reader_task: Some(reader_task_handle),
@@ -2483,6 +2495,61 @@ impl VeilClient {
     /// Whether this IPC connection negotiated private admission batches.
     pub fn supports_pnet_admission_batch(&self) -> bool {
         self.pnet_admission_batch
+    }
+
+    /// Whether the local daemon negotiated verification of presented P-Net
+    /// certificates on this authority-aware connection.
+    pub fn supports_pnet_member_verification(&self) -> bool {
+        self.pnet_member_verification
+    }
+
+    /// Verify an owner-signed membership certificate against the current
+    /// daemon's trust root and bans. `None` means rejected, and `Some(0)`
+    /// represents non-expiring membership. Route admission requires a
+    /// separate proof of identity and liveness.
+    pub async fn verify_pnet_member(
+        &self,
+        member_node_id: &[u8; 32],
+        certificate: &[u8],
+    ) -> Result<Option<u64>, ClientError> {
+        if !self.supports_pnet_member_verification() {
+            return Err(ClientError::Protocol(
+                "P-Net certificate verification was not negotiated".into(),
+            ));
+        }
+        if certificate.is_empty()
+            || certificate.len() > veil_proto::budget::MAX_MEMBERSHIP_CERT_SIZE
+        {
+            return Err(ClientError::Protocol(
+                "invalid P-Net certificate size".into(),
+            ));
+        }
+        let request_id = self.writer.alloc_request_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut dispatch = self.dispatch.lock().await;
+            let pending = &mut dispatch.pending_pnet_member_verifications;
+            prune_closed(pending);
+            if pending.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(
+                    "P-Net certificate query queue is full".into(),
+                ));
+            }
+            pending.push_back((request_id, tx));
+        }
+        let mut body = Vec::with_capacity(member_node_id.len() + certificate.len());
+        body.extend_from_slice(member_node_id);
+        body.extend_from_slice(certificate);
+        self.writer
+            .write_request_frame(LocalAppMsg::VerifyPnetMember as u16, request_id, &body)
+            .await?;
+        let reply = await_rpc_reply(rx, "P-Net certificate verification reply").await??;
+        if &reply.member_node_id != member_node_id {
+            return Err(ClientError::Protocol(
+                "P-Net certificate reply did not match member".into(),
+            ));
+        }
+        Ok(reply.valid_until_unix)
     }
 
     /// Check private admissions in order for a bounded list of explicit peer IDs.
@@ -3708,6 +3775,24 @@ async fn reader_task(
                     let _ = tx.send(decode_pnet_admission_batch(&body));
                 }
             }
+            LocalAppMsg::VerifyPnetMemberResult
+                if hdr.family == FrameFamily::LocalApp as u8 && hdr.request_id != 0 =>
+            {
+                let waiter = {
+                    let mut dispatch = dispatch.lock().await;
+                    take_pending(
+                        &mut dispatch.pending_pnet_member_verifications,
+                        hdr.request_id,
+                    )
+                };
+                if let Some(tx) = waiter {
+                    let reply =
+                        veil_proto::ipc::PnetMemberVerification::decode(&body).ok_or_else(|| {
+                            ClientError::Protocol("invalid P-Net certificate reply".into())
+                        });
+                    let _ = tx.send(reply);
+                }
+            }
             LocalAppMsg::ListenTransportsResult => {
                 use veilcore::proto::ListenTransportsResultPayload;
                 if let Ok(p) = ListenTransportsResultPayload::decode(&body) {
@@ -4284,6 +4369,7 @@ mod tests {
             client_token: [0; 16],
             reader_task: None,
             pnet_admission_batch: false,
+            pnet_member_verification: false,
             pnet_authority: None,
             pnet_status_reader: None,
         };
@@ -4331,6 +4417,7 @@ mod tests {
             client_token: [0; 16],
             reader_task: None,
             pnet_admission_batch: true,
+            pnet_member_verification: false,
             pnet_authority: None,
             pnet_status_reader: None,
         };

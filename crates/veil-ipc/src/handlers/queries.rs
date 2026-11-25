@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::Instant;
 use veil_abuse::rate_limiter::TokenBucket;
-use veil_proto::ipc::{PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission};
+use veil_proto::ipc::{PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission, PnetMemberVerification};
 use veil_proto::{
     CreateBootstrapInvitePayload, CreateBootstrapInviteResultPayload, FrameFamily,
     JoinBootstrapPayload, JoinBootstrapResultPayload, LocalAppMsg, LookupRelayKeyPayload,
@@ -218,6 +218,8 @@ pub(crate) struct PnetStatusQueries {
     provider: Arc<dyn PnetStatusProvider>,
     batch_budget: Mutex<TokenBucket>,
     batch_slots: Arc<Semaphore>,
+    member_verification_budget: std::sync::Mutex<TokenBucket>,
+    member_verification_slots: Arc<Semaphore>,
 }
 
 impl PnetStatusQueries {
@@ -231,11 +233,75 @@ impl PnetStatusQueries {
                 PNET_BATCH_LOOKUPS_PER_SEC,
             )),
             batch_slots: Arc::new(Semaphore::new(PNET_BATCH_MAX_IN_FLIGHT)),
+            member_verification_budget: std::sync::Mutex::new(TokenBucket::new(128.0, 256.0)),
+            member_verification_slots: Arc::new(Semaphore::new(4)),
         }
     }
 
     pub(crate) fn authority(&self) -> Option<veil_proto::ipc::PnetAuthority> {
         self.provider.authority()
+    }
+
+    pub(crate) fn supports_member_verification(&self) -> bool {
+        self.provider.supports_member_verification()
+    }
+
+    pub(crate) fn queue_member_verification(
+        &self,
+        request_id: u32,
+        body: &[u8],
+        client_state: &mut IpcClientState,
+        spawn_sem: &Arc<Semaphore>,
+        reply_tx: &mpsc::Sender<LoopReply>,
+    ) {
+        let Some((member, certificate)) = body.split_first_chunk::<32>() else {
+            return;
+        };
+        if request_id == 0
+            || certificate.is_empty()
+            || certificate.len() > veil_proto::budget::MAX_MEMBERSHIP_CERT_SIZE
+            || !client_state.allow_query()
+        {
+            return;
+        }
+        let Ok(client_slot) = Arc::clone(spawn_sem).try_acquire_owned() else {
+            return;
+        };
+        let Ok(verify_slot) = Arc::clone(&self.member_verification_slots).try_acquire_owned()
+        else {
+            return;
+        };
+        if !veil_util::lock!(self.member_verification_budget).allow_at(std::time::Instant::now()) {
+            return;
+        }
+        let provider = Arc::clone(&self.provider);
+        let member = *member;
+        let certificate = certificate.to_vec();
+        let reply_tx = reply_tx.clone();
+        tokio::spawn(async move {
+            let _client_slot = client_slot;
+            if reply_tx.is_closed() {
+                return;
+            }
+            let result = tokio::task::spawn_blocking(move || {
+                let _verify_slot = verify_slot;
+                provider.verify_member(&member, &certificate)
+            })
+            .await;
+            if let Ok(valid_until_unix) = result {
+                let body = PnetMemberVerification {
+                    member_node_id: member,
+                    valid_until_unix,
+                };
+                let _ = reply_tx
+                    .send(LoopReply::Frame(encode_reply_frame_id(
+                        LocalAppMsg::VerifyPnetMemberResult as u16,
+                        request_id,
+                        &body.encode(),
+                    )))
+                    .await;
+            }
+        });
     }
 
     pub(crate) fn admits(&self, peer: &[u8; 32]) -> bool {

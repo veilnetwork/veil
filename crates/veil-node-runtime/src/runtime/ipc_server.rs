@@ -555,7 +555,8 @@ impl NodeRuntime {
             Arc::clone(&self.session_tx_registry),
         )
         .with_bans(Arc::clone(&self.ban_list))
-        .with_authority(authority);
+        .with_authority(authority)
+        .with_member_gate(self.network_gate.clone());
         server = server.with_pnet_status_provider(Arc::new(pnet_status));
         // Listen-transports provider — surfaces the dispatcher's listener
         // snapshot (wildcard hosts rewritten to the observed external IP

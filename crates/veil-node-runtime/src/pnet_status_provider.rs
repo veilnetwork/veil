@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use veil_abuse::BanList;
 use veil_cfg::NodeId;
+use veil_identity::network_access::NetworkAccessGate;
 use veil_ipc::PnetStatusProvider;
 use veil_proto::PnetStatusResultPayload;
 use veil_session::{SessionEntry, SessionRegistry, SessionTxRegistry};
@@ -27,6 +28,7 @@ pub struct DaemonPnetStatus {
     tx: Arc<RwLock<SessionTxRegistry>>,
     bans: Option<Arc<Mutex<BanList>>>,
     authority: Option<veil_proto::ipc::PnetAuthority>,
+    member_gate: Option<Arc<NetworkAccessGate>>,
 }
 
 impl DaemonPnetStatus {
@@ -41,6 +43,7 @@ impl DaemonPnetStatus {
             tx,
             bans: None,
             authority: None,
+            member_gate: None,
         }
     }
 
@@ -54,6 +57,11 @@ impl DaemonPnetStatus {
         authority: Option<veil_proto::ipc::PnetAuthority>,
     ) -> Self {
         self.authority = authority;
+        self
+    }
+
+    pub(crate) fn with_member_gate(mut self, gate: Option<Arc<NetworkAccessGate>>) -> Self {
+        self.member_gate = gate;
         self
     }
 
@@ -73,6 +81,33 @@ impl DaemonPnetStatus {
 impl PnetStatusProvider for DaemonPnetStatus {
     fn authority(&self) -> Option<veil_proto::ipc::PnetAuthority> {
         self.authority
+    }
+
+    fn supports_member_verification(&self) -> bool {
+        self.member_gate.is_some() && self.bans.is_some() && self.authority.is_some()
+    }
+
+    fn verify_member(&self, member_node_id: &[u8; 32], blob: &[u8]) -> Option<u64> {
+        let authority = self.authority?;
+        let gate = self.member_gate.as_ref()?;
+        let bans = self.bans.as_ref()?;
+        let now = unix_secs_now_u64();
+        if !authority.is_current(now)
+            || blob.len() > veil_proto::budget::MAX_MEMBERSHIP_CERT_SIZE
+            || lock!(bans).is_banned(member_node_id)
+        {
+            return None;
+        }
+        let cert = gate.verify_peer(Some(blob), member_node_id, now).ok()?;
+        let expiry = match (authority.local_valid_until_unix, cert.valid_until_unix) {
+            (0, expires) | (expires, 0) => expires,
+            (local, remote) => local.min(remote),
+        };
+        // A ban can arrive while the signature is being verified. Keep the
+        // same revocation check on the result path as on the admission path.
+        let now = unix_secs_now_u64();
+        (now != 0 && (expiry == 0 || now < expiry) && !lock!(bans).is_banned(member_node_id))
+            .then_some(expiry)
     }
 
     fn private_peer_status(&self, peer_node_id: &[u8; 32]) -> Option<PnetStatusResultPayload> {
@@ -293,6 +328,84 @@ mod tests {
 
         bans.lock().unwrap().unban(&DEVICE);
         assert!(status.peer_status(&DEVICE).admitted);
+    }
+
+    #[test]
+    fn presented_membership_proof_checks_owner_identity_expiry_and_revocation_without_admission() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use veil_identity::network_cert::{canonical_cert_body, encode_cert_blob};
+        use veil_proto::ipc::{PnetAuthority, PnetTrustRoot};
+        use veil_types::SignatureAlgorithm;
+
+        let (status, _outbox) = provider(DEVICE, None);
+        let bans = Arc::new(Mutex::new(BanList::new()));
+        let signer = SigningKey::from_bytes(&[0x01; 32]);
+        let owner = signer.verifying_key().to_bytes();
+        let algorithm = SignatureAlgorithm::Ed25519;
+        let network = [0x52; 32];
+        let now = unix_secs_now_u64();
+        let local_expiry = now + 300;
+        let authority = PnetAuthority {
+            root: PnetTrustRoot::from_owner(network, algorithm, &owner),
+            local_valid_until_unix: local_expiry,
+        };
+        let gate = NetworkAccessGate {
+            local_cert_blob: Vec::new(),
+            expected_network_id: network,
+            owner_algo: algorithm,
+            owner_pubkey_bytes: owner.to_vec(),
+            admin_node_ids: Default::default(),
+        };
+        let mut status = status
+            .with_authority(Some(authority))
+            .with_member_gate(Some(Arc::new(gate)))
+            .with_bans(Arc::clone(&bans));
+        assert!(status.supports_member_verification());
+        let sign = |signer: &SigningKey, network_id, expires| {
+            let mut cert = MembershipCert {
+                version: veil_types::MEMBERSHIP_CERT_VERSION,
+                network_id,
+                member_node_id: STRANGER,
+                issued_at_unix: now - 100,
+                valid_until_unix: expires,
+                admin: false,
+                algo: algorithm,
+                owner_signature: Vec::new(),
+            };
+            cert.owner_signature = signer.sign(&canonical_cert_body(&cert)).to_bytes().to_vec();
+            encode_cert_blob(&cert)
+        };
+        let good = sign(&signer, network, 0);
+        assert_eq!(status.verify_member(&STRANGER, &good), Some(local_expiry));
+        assert_eq!(
+            status.verify_member(&STRANGER, &sign(&signer, network, now + 120)),
+            Some(now + 120)
+        );
+        assert!(!status.peer_status(&STRANGER).admitted);
+        assert!(!status.peer_status(&STRANGER).has_cert);
+        assert_eq!(status.verify_member(&DEVICE, &good), None);
+        assert_eq!(
+            status.verify_member(&STRANGER, &sign(&signer, [8; 32], 0)),
+            None
+        );
+        let other = SigningKey::from_bytes(&[0x02; 32]);
+        assert_eq!(
+            status.verify_member(&STRANGER, &sign(&other, network, 0)),
+            None
+        );
+        assert_eq!(
+            status.verify_member(&STRANGER, &sign(&signer, network, now - 1)),
+            None
+        );
+
+        lock!(bans).ban_manual(STRANGER, "test ban");
+        assert_eq!(status.verify_member(&STRANGER, &good), None);
+        lock!(bans).unban(&STRANGER);
+        status.authority = Some(PnetAuthority {
+            local_valid_until_unix: now,
+            ..authority
+        });
+        assert_eq!(status.verify_member(&STRANGER, &good), None);
     }
 
     #[test]

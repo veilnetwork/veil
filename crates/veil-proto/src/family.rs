@@ -945,6 +945,11 @@ pub enum LocalAppMsg {
     PnetAdmissionBatchQuery = 98,
     /// Daemon → app. Correlated private admission records in request order.
     PnetAdmissionBatchResult = 99,
+    /// Local IPC certificate verification. Body is the member ID followed by
+    /// its bounded, owner-signed membership certificate.
+    VerifyPnetMember = 100,
+    /// Verification of the submitted membership proof against local policy.
+    VerifyPnetMemberResult = 101,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -1051,6 +1056,8 @@ impl TryFrom<u16> for LocalAppMsg {
             97 => Ok(LocalAppMsg::LocalSourceGrowthHold),
             98 => Ok(LocalAppMsg::PnetAdmissionBatchQuery),
             99 => Ok(LocalAppMsg::PnetAdmissionBatchResult),
+            100 => Ok(LocalAppMsg::VerifyPnetMember),
+            101 => Ok(LocalAppMsg::VerifyPnetMemberResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,
