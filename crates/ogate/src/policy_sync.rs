@@ -9,7 +9,7 @@ use anyhow::{Context as _, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 use veil_identity::network_policy::{
     MAX_SIGNED_ROUTE_POLICY_BYTES, VerifiedRoutePolicy, VerifiedRoutePolicyOffer,
 };
@@ -31,6 +31,7 @@ const RECOVERY_POLL_MIN_MS: u64 = 4_000;
 const RECOVERY_POLL_JITTER_MS: u64 = 2_000;
 const SESSION_POLL_DELAY_MS: u64 = 500;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(12);
+const STREAM_CLOSE_GRACE: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SERVING: usize = PNET_ADMISSION_BATCH_MAX_PEERS;
 // Leave headroom in the daemon's per-connection query budget.
@@ -324,8 +325,8 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
     let mut reconnecting = false;
     let mut previous_poll: Option<(Arc<VeilClient>, broadcast::Receiver<VeilEvent>)> = None;
     while distribution.authority.is_current(unix_secs_now_u64()) {
-        let mut client = match distribution.connect(true).await {
-            Ok(client) => client,
+        let client = match distribution.connect(true).await {
+            Ok(client) => Arc::new(client),
             Err(error) => {
                 tracing::debug!(%error, "P-Net policy subscriber IPC unavailable");
                 previous_poll = None;
@@ -338,53 +339,65 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
         // Retire the last connection only after the replacement is watching.
         // Its buffered events can cover joins during the poll and the IPC
         // handshake. Only the replacement can run the next poll.
-        let mirror_hint = previous_poll.take().is_some_and(|(previous, mut events)| {
+        let mut mirror_hint = previous_poll.take().is_some_and(|(previous, mut events)| {
             reconnecting |= previous.is_disconnected();
             queued_mirror_poll_hint(&mut events, &mirrors)
         });
-        let wake = wait_for_policy_poll(
-            &mut client,
-            &mut events,
-            &mut schedule,
-            &mirrors,
-            reconnecting || mirror_hint,
-            &mut expiry,
-        )
-        .await;
-        let periodic = match wake {
-            PollWake::Periodic => true,
-            PollWake::Expedited => false,
-            PollWake::Disconnected => {
-                reconnecting = true;
-                tokio::time::sleep(recovery).await;
-                continue;
+        let mut app = None;
+        loop {
+            let hint = std::mem::take(&mut mirror_hint);
+            let wake = wait_for_policy_poll(
+                &client,
+                &mut events,
+                &mut schedule,
+                &mirrors,
+                reconnecting || hint,
+                &mut expiry,
+            )
+            .await;
+            let periodic = match wake {
+                PollWake::Periodic => true,
+                PollWake::Expedited => false,
+                PollWake::Disconnected => {
+                    reconnecting = true;
+                    tokio::time::sleep(recovery).await;
+                    break;
+                }
+            };
+            let started = Instant::now();
+            if !distribution.authority.is_current(unix_secs_now_u64()) {
+                return;
             }
-        };
-        let started = Instant::now();
-        if !distribution.authority.is_current(unix_secs_now_u64()) {
-            return;
-        }
-        if !periodic {
-            if reconnecting {
-                tracing::debug!("P-Net subscriber IPC recovery expedited mirror polling");
-            } else {
-                tracing::debug!("P-Net session event expedited mirror polling");
+            if !periodic {
+                if reconnecting {
+                    tracing::debug!("P-Net subscriber IPC recovery expedited mirror polling");
+                } else {
+                    tracing::debug!("P-Net session event expedited mirror polling");
+                }
             }
-        }
-        schedule.earliest = started + recovery;
-        let client = Arc::new(client);
-        if let Err(error) = poll_mirrors(policy, distribution, &mirrors, &client).await {
-            tracing::debug!(%error, "P-Net policy refresh failed");
-        }
-        reconnecting = client.is_disconnected();
-        previous_poll = Some((client, events));
-        if periodic {
-            let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), recovery);
-            let now = Instant::now();
-            schedule.next = started + delay;
-            if schedule.next <= now {
-                schedule.next = now + delay;
+            schedule.earliest = started + recovery;
+            let reuse = match poll_mirrors(policy, distribution, &mirrors, &client, &mut app).await
+            {
+                Ok(reuse) => reuse,
+                Err(error) => {
+                    tracing::debug!(%error, "P-Net policy refresh failed");
+                    false
+                }
+            };
+            if periodic {
+                let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), recovery);
+                let now = Instant::now();
+                schedule.next = started + delay;
+                if schedule.next <= now {
+                    schedule.next = now + delay;
+                }
             }
+            reconnecting = client.is_disconnected();
+            if reconnecting || !reuse {
+                previous_poll = Some((client, events));
+                break;
+            }
+            mirror_hint = queued_mirror_poll_hint(&mut events, &mirrors);
         }
     }
 }
@@ -403,7 +416,7 @@ struct PollSchedule {
 }
 
 async fn wait_for_policy_poll(
-    client: &mut VeilClient,
+    client: &VeilClient,
     events: &mut broadcast::Receiver<VeilEvent>,
     schedule: &mut PollSchedule,
     mirrors: &[NodeId],
@@ -420,6 +433,10 @@ async fn wait_for_policy_poll(
     // an expedited round.
     let mut requested = mirror_hint.then(|| Instant::now() + event_delay);
     advance_poll_for_expiry(&mut schedule.next, expiry, recovery);
+    let disconnected = client
+        .pnet_status_disconnected()
+        .expect("policy polls use a P-Net status connection");
+    tokio::pin!(disconnected);
     let mut listen = true;
     loop {
         let periodic = schedule.next.max(earliest);
@@ -427,7 +444,7 @@ async fn wait_for_policy_poll(
             .and_then(|requested| expedited_poll(requested, earliest, periodic, recovery))
             .unwrap_or(periodic);
         tokio::select! {
-            _ = client.wait_disconnected() => return PollWake::Disconnected,
+            _ = &mut disconnected => return PollWake::Disconnected,
             _ = sleep_until(due) => return if due == periodic {
                 PollWake::Periodic
             } else {
@@ -542,7 +559,8 @@ async fn poll_mirrors(
     distribution: &Distribution<'_>,
     mirrors: &[NodeId],
     client: &Arc<VeilClient>,
-) -> anyhow::Result<()> {
+    app: &mut Option<Arc<AppHandle>>,
+) -> anyhow::Result<bool> {
     let revision = {
         let policy = Arc::clone(policy);
         tokio::task::spawn_blocking(move || policy.refresh())
@@ -558,41 +576,47 @@ async fn poll_mirrors(
         .map(|entry| entry.peer_node_id)
         .collect();
     if active.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
-    let app = Arc::new(
-        while_policy_ipc_connected(
-            client,
-            client.bind(&distribution.namespace, "route-policy-fetch", ENDPOINT),
-        )
-        .await?,
-    );
+    let app = match app {
+        Some(app) => app,
+        None => {
+            let bound = while_policy_ipc_connected(
+                client,
+                client.bind(&distribution.namespace, "route-policy-fetch", ENDPOINT),
+            )
+            .await?;
+            app.insert(Arc::new(bound))
+        }
+    };
     let mut pending = JoinSet::new();
     for source in active {
-        let app = Arc::clone(&app);
+        let app = Arc::clone(app);
         let client = Arc::clone(client);
         let policy = Arc::clone(policy);
         let remote = veil_app::address::app_id(&source, &distribution.namespace, SERVICE);
-        pending.spawn(async move {
-            match fetch_offer(&client, &app, policy, source, remote, revision).await {
-                Ok(offer) => offer,
-                Err(error) => {
-                    tracing::debug!(%error, "P-Net policy mirror offer rejected");
-                    None
-                }
-            }
-        });
+        pending.spawn(
+            async move { fetch_offer(&client, &app, policy, source, remote, revision).await },
+        );
     }
 
     // Recheck all sources in one query, after transfers and signature validation.
     let mut offers = Vec::new();
+    let mut reuse = true;
     while let Some(result) = pending.join_next().await {
-        if let Some(offer) = result? {
-            offers.push(offer);
+        match result? {
+            Ok((offer, closed)) => {
+                offers.extend(offer);
+                reuse &= closed;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "P-Net policy mirror offer rejected");
+                reuse = false;
+            }
         }
     }
     if offers.is_empty() {
-        return Ok(());
+        return Ok(reuse);
     }
     let sources: Vec<_> = offers.iter().map(|offer| offer.source).collect();
     let admissions =
@@ -608,7 +632,7 @@ async fn poll_mirrors(
         tracing::warn!(
             "P-Net mirrors supplied conflicting owner-signed policies at the same revision"
         );
-        return Ok(());
+        return Ok(reuse);
     }
     if let Some(offer) = selection.best {
         let policy = Arc::clone(policy);
@@ -628,7 +652,7 @@ async fn poll_mirrors(
         .await??;
         tracing::info!(revision, "installed P-Net route policy from mirror");
     }
-    Ok(())
+    Ok(reuse)
 }
 
 /// Read a configured mirror after the caller's initial admission check.
@@ -646,11 +670,10 @@ pub(crate) async fn probe_mirror(
     let remote = veil_app::address::app_id(&source, &namespace, SERVICE);
     // Every valid revision is greater than zero. Request the snapshot
     // even at the local revision so the operator can compare contents.
-    let offer = fetch_offer(client, &app, Arc::clone(policy), source, remote, 0)
-        .await?
-        .context(
-            "mirror answered but offered no current policy; check the mirror's installed snapshot",
-        )?;
+    let (offer, _) = fetch_offer(client, &app, Arc::clone(policy), source, remote, 0).await?;
+    let offer = offer.context(
+        "mirror answered but offered no current policy; check the mirror's installed snapshot",
+    )?;
     let admissions = client
         .peer_pnet_admissions(&[source])
         .await
@@ -673,9 +696,10 @@ async fn fetch_offer(
     source: NodeId,
     remote: [u8; 32],
     revision: u64,
-) -> anyhow::Result<Option<Offer>> {
-    let bytes = while_policy_ipc_connected(client, async {
-        timeout(TRANSFER_TIMEOUT, async {
+) -> anyhow::Result<(Option<Offer>, bool)> {
+    let deadline = Instant::now() + TRANSFER_TIMEOUT;
+    let (bytes, closed) = while_policy_ipc_connected(client, async {
+        let (mut stream, bytes) = timeout_at(deadline, async {
             let mut stream = app
                 .open_stream(
                     source,
@@ -689,14 +713,24 @@ async fn fetch_offer(
             request[..4].copy_from_slice(&REQUEST_MAGIC);
             request[4..].copy_from_slice(&revision.to_be_bytes());
             stream.write_all(&request).await?;
-            read_snapshot(&mut stream).await
+            let bytes = read_snapshot(&mut stream).await?;
+            Ok::<_, anyhow::Error>((stream, bytes))
         })
         .await
-        .context("P-Net policy mirror transfer timed out")?
+        .context("P-Net policy mirror transfer timed out")??;
+        // The reader retires its local dispatch entry at EOF. Preserve a
+        // complete response even if the peer's close is missing or delayed,
+        // but discard the IPC before another round can accumulate state on it.
+        let close_deadline = deadline.min(Instant::now() + STREAM_CLOSE_GRACE);
+        let closed = matches!(
+            timeout_at(close_deadline, stream.read(&mut [0; 1])).await,
+            Ok(Ok(0))
+        );
+        Ok::<_, anyhow::Error>((bytes, closed))
     })
     .await?;
     let Some(bytes) = bytes else {
-        return Ok(None);
+        return Ok((None, closed));
     };
     // Keep verification scoped to this round even when a blocking worker
     // is busy. The transfer timer cannot leave a detached verifier behind.
@@ -705,7 +739,7 @@ async fn fetch_offer(
         verified.policy().revision > revision,
         "mirror did not supply a newer P-Net policy revision"
     );
-    Ok(Some(Offer { source, verified }))
+    Ok((Some(Offer { source, verified }), closed))
 }
 
 async fn read_snapshot(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<Option<Vec<u8>>> {
@@ -880,7 +914,9 @@ mod tests {
         })
         .await
         .unwrap();
-        let mut client = VeilClient::connect(&socket).await.unwrap();
+        let client = VeilClient::connect_for_pnet_status(&socket, false)
+            .await
+            .unwrap();
         let mut events = client.events_with_lag().await;
         let now = Instant::now();
         let earliest = now + Duration::from_millis(100);
@@ -905,7 +941,7 @@ mod tests {
             }
         };
         let wait = wait_for_policy_poll(
-            &mut client,
+            &client,
             &mut events,
             &mut schedule,
             &[[7; 32]],

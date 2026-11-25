@@ -1526,10 +1526,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   with a per-node delay and 4–6 s minimum spacing. It leaves the
   ordinary deadline in place and permits a single in-flight round.
   A hint received during that round can also request the next poll.
-  The previous connection can supply queued hints until the
-  replacement has authenticated and subscribed.
+  Healthy polls share one authenticated IPC connection and one local
+  fetch endpoint. A failed transfer or missing stream close causes the
+  subscriber to replace that connection before the next poll. A complete
+  offer still goes through the usual verification and admission checks.
+  The previous connection can supply queued hints until its replacement
+  has authenticated and subscribed.
   Each poll checks all configured mirrors and revalidates their
   admission and the signed offers.
+- In a paired Linux ARM64 run, three 4,096-assignment updates used one
+  subscriber IPC connection and one fetch bind, down from three of each.
+  All three snapshots matched the publisher's signed bytes. Suppressing
+  a stream close still allowed a complete offer to install, and suppressing
+  a stream-open reply deferred installation to the next connection. Both
+  recoveries used a fresh connection, fresh binding and admission checks.
+  The original gateways and TUN interfaces kept forwarding, with SDK
+  traffic in both directions.
 - A paired three-node Linux ARM64 run admitted an ordinary private
   member after the first poll. The control ran one extra poll before
   the regular deadline. The candidate ran zero. After the configured
