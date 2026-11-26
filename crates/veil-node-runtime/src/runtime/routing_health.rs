@@ -56,7 +56,13 @@ async fn run_route_probes(
             let mut battery_multiplier = None;
 
             for (peer, registration) in peers {
-                if next_probe.get(&peer).is_some_and(|due| now < *due) {
+                // Session registration used to wait for the next scheduler
+                // tick. Keep that ordering with startup and NAT control frames.
+                let due = next_probe.entry(peer).or_insert_with(|| {
+                    let next_second = now.duration_since(clock_start).as_secs() + 1;
+                    clock_start + Duration::from_secs(next_second)
+                });
+                if now < *due {
                     continue;
                 }
                 let multiplier = *battery_multiplier.get_or_insert_with(|| {
@@ -579,9 +585,12 @@ mod route_probe_tests {
         assert!(wakes.0.load(Ordering::Relaxed) > 0);
         assert!(task.as_mut().poll(&mut cx).is_pending());
         assert!(
-            first.try_recv().is_ok(),
-            "new peer is probed on registration"
+            first.try_recv().is_err(),
+            "registration sends no periodic probe"
         );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        assert!(first.try_recv().is_ok(), "first probe at the next tick");
 
         tier.send_replace(2);
         assert!(task.as_mut().poll(&mut cx).is_pending());
@@ -596,7 +605,10 @@ mod route_probe_tests {
         assert!(wakes.0.load(Ordering::Relaxed) > 0);
         assert!(task.as_mut().poll(&mut cx).is_pending());
         assert!(first.try_recv().is_ok(), "overdue probe after resuming");
-        assert!(second.try_recv().is_ok(), "peer added while paused");
+        assert!(
+            second.try_recv().is_err(),
+            "new peer waits for the next tick"
+        );
 
         wakes.0.store(0, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(500)).await;
