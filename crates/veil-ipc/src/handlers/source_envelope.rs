@@ -118,7 +118,7 @@ impl<'a> EnvelopeChunks<'a> {
             })
     }
 
-    fn chunk_payload(&self, index: usize, data: &[u8]) -> Vec<u8> {
+    fn chunk_header(&self, index: usize) -> [u8; ChunkedEnvelopePayload::HEADER_SIZE] {
         let chunk = ChunkedEnvelopePayload {
             transfer_id: self.transfer_id,
             chunk_index: index as u32,
@@ -126,13 +126,16 @@ impl<'a> EnvelopeChunks<'a> {
             total_size: self.envelope.payload.len() as u32,
             orig_content_id: self.content_id(),
             require_ack: self.require_ack,
-            data: data.to_vec(),
+            data: Vec::new(),
         };
-        if self.committed_id.is_some() {
-            chunk.encode_committed()
-        } else {
-            chunk.encode()
-        }
+        chunk.encode_header(self.committed_id.is_some())
+    }
+
+    fn chunk_payload(&self, index: usize, data: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(ChunkedEnvelopePayload::HEADER_SIZE + data.len());
+        encoded.extend_from_slice(&self.chunk_header(index));
+        encoded.extend_from_slice(data);
+        encoded
     }
 
     pub(super) fn frames_for(&self, next_hop: [u8; 32]) -> impl Iterator<Item = Vec<u8>> + '_ {
@@ -160,25 +163,21 @@ impl<'a> EnvelopeChunks<'a> {
                     content_id,
                     created_at: self.envelope.created_at,
                     ttl_secs: self.envelope.ttl_secs,
-                    payload: self.chunk_payload(index, data),
+                    payload: Vec::new(),
                     trace_id: self.envelope.trace_id,
                     require_ack: false,
                 };
-                let body = ForwardPayload {
+                let forward = ForwardPayload {
                     next_hop_node_id: next_hop,
                     envelope,
                     relay_hops: 0,
                     delivery_attempt: None,
                     traffic_class: neutral_datagram.then_some(veil_proto::priority::INTERACTIVE),
-                }
-                .encode();
+                };
                 let mut header =
                     FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
                 header.set_priority(veil_proto::priority::INTERACTIVE);
-                header.body_len = body.len() as u32;
-                let mut frame = codec::encode_header(&header).to_vec();
-                frame.extend(body);
-                frame
+                forward.encode_frame_with_chunk(header, &self.chunk_header(index), data)
             })
     }
 }
@@ -423,6 +422,62 @@ pub(super) async fn admit_direct_plain(
 mod tests {
     use super::*;
     use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn forwarded_chunks_match_the_owned_encoding() {
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::specific([1; 32], [2; 16]),
+            sender_node_id: [3; 32],
+            src_app_id: [4; 32],
+            app_id: [5; 32],
+            endpoint_id: 7,
+            content_id: [6; 32],
+            created_at: 123,
+            ttl_secs: 30,
+            payload: vec![0xa5; 3601],
+            trace_id: 456,
+            require_ack: false,
+        };
+        for committed in [false, true] {
+            let mut chunks = EnvelopeChunks::new(&envelope, committed, 3600).unwrap();
+            if committed {
+                chunks = chunks.with_content_commitment();
+            }
+            for neutral_datagram in [false, true] {
+                for (index, frame) in chunks
+                    .frames_for_transport([7; 32], neutral_datagram)
+                    .enumerate()
+                {
+                    let body = &frame[veil_proto::header::HEADER_SIZE..];
+                    let mut forward = ForwardPayload::decode(body).unwrap();
+                    assert_eq!(forward.envelope.trace_id, envelope.trace_id);
+                    assert_eq!(
+                        forward.traffic_class,
+                        neutral_datagram.then_some(veil_proto::priority::INTERACTIVE)
+                    );
+                    let data = envelope.payload.chunks(3600).nth(index).unwrap();
+                    let chunk = ChunkedEnvelopePayload {
+                        transfer_id: chunks.transfer_id,
+                        chunk_index: index as u32,
+                        chunk_count: 2,
+                        total_size: 3601,
+                        orig_content_id: chunks.content_id(),
+                        require_ack: committed,
+                        data: data.to_vec(),
+                    };
+                    forward.envelope.payload = if committed {
+                        chunk.encode_committed()
+                    } else {
+                        chunk.encode()
+                    };
+                    assert_eq!(body, forward.encode());
+                    let header = codec::decode_header(&frame).unwrap();
+                    assert_eq!(header.body_len as usize, body.len());
+                    assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                }
+            }
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn packetized_control_has_a_bounded_ingress_wait_and_keeps_acked_delivery() {

@@ -175,12 +175,18 @@ impl DeliveryEnvelope {
     /// Encode to wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::FIXED_SIZE + self.payload.len());
+        self.encode_header_into(&mut buf, self.payload.len());
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    fn encode_header_into(&self, buf: &mut Vec<u8>, payload_len: usize) {
         // emit the fixed-49-byte recipient
         // form (node_id + tag byte + 16-byte instance_id
         // zero-padded for Any/All) so peers can natively request
         // `InstanceTag::All` fan-out or `::Specific` targeting
         // over the wire.
-        self.recipient.encode_fixed_into(&mut buf);
+        self.recipient.encode_fixed_into(buf);
         buf.extend_from_slice(&self.sender_node_id);
         buf.extend_from_slice(&self.src_app_id);
         buf.extend_from_slice(&self.app_id);
@@ -196,12 +202,10 @@ impl DeliveryEnvelope {
             };
         buf.extend_from_slice(&ttl_wire.to_be_bytes());
         debug_assert!(
-            self.payload.len() <= crate::codec::MAX_FRAME_BODY as usize,
+            payload_len <= crate::codec::MAX_FRAME_BODY as usize,
             "payload exceeds MAX_FRAME_BODY"
         );
-        buf.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&self.payload);
-        buf
+        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
     }
 
     /// Parse from wire bytes. Returns the decoded envelope and the number of
@@ -411,16 +415,44 @@ impl ForwardPayload {
     /// Encode to wire bytes. Always appends `trace_id` (8 bytes) and
     /// `relay_hops` (1 byte) after the envelope.
     pub fn encode(&self) -> Vec<u8> {
-        let env_bytes = self.envelope.encode();
-        let mut buf = Vec::with_capacity(
-            32 + env_bytes.len()
-                + 8
-                + 1
-                + usize::from(self.delivery_attempt.is_some()) * 2
-                + usize::from(self.traffic_class.is_some()) * 2,
-        );
+        let payload_len = self.envelope.payload.len();
+        let mut buf = Vec::with_capacity(self.encoded_len(payload_len));
+        self.encode_into(&mut buf, payload_len, &[&self.envelope.payload]);
+        buf
+    }
+
+    /// Encode a frame using a borrowed chunk header and data as the envelope
+    /// payload. The other fields come from this forward and its envelope.
+    pub fn encode_frame_with_chunk(
+        &self,
+        mut header: crate::FrameHeader,
+        chunk_header: &[u8; ChunkedEnvelopePayload::HEADER_SIZE],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let payload_len = chunk_header.len() + data.len();
+        let body_len = self.encoded_len(payload_len);
+        header.body_len = body_len as u32;
+        let mut buf = Vec::with_capacity(crate::header::HEADER_SIZE + body_len);
+        buf.extend_from_slice(&crate::codec::encode_header(&header));
+        self.encode_into(&mut buf, payload_len, &[chunk_header, data]);
+        buf
+    }
+
+    fn encoded_len(&self, payload_len: usize) -> usize {
+        32 + DeliveryEnvelope::FIXED_SIZE
+            + payload_len
+            + 8
+            + 1
+            + usize::from(self.delivery_attempt.is_some()) * 2
+            + usize::from(self.traffic_class.is_some()) * 2
+    }
+
+    fn encode_into(&self, buf: &mut Vec<u8>, payload_len: usize, parts: &[&[u8]]) {
         buf.extend_from_slice(&self.next_hop_node_id);
-        buf.extend_from_slice(&env_bytes);
+        self.envelope.encode_header_into(buf, payload_len);
+        for part in parts {
+            buf.extend_from_slice(part);
+        }
         buf.extend_from_slice(&self.envelope.trace_id.to_be_bytes());
         buf.push(self.relay_hops);
         if let Some(attempt) = self.delivery_attempt {
@@ -431,7 +463,6 @@ impl ForwardPayload {
             buf.push(FORWARD_TRAFFIC_CLASS_MARKER);
             buf.push(tc);
         }
-        buf
     }
 
     /// Parse from wire bytes. Requires the fixed `trace_id || relay_hops`
@@ -727,19 +758,28 @@ impl ChunkedEnvelopePayload {
     /// Encode to wire bytes (marker-prefixed).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.data.len());
-        buf.push(CHUNKED_ENVELOPE_MARKER);
-        buf.extend_from_slice(&self.transfer_id);
-        buf.extend_from_slice(&self.chunk_index.to_be_bytes());
-        buf.extend_from_slice(&self.chunk_count.to_be_bytes());
-        buf.extend_from_slice(&self.total_size.to_be_bytes());
-        buf.extend_from_slice(&self.orig_content_id);
-        buf.push(if self.require_ack {
-            CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK
-        } else {
-            0
-        });
+        buf.extend_from_slice(&self.encode_header(false));
         buf.extend_from_slice(&self.data);
         buf
+    }
+
+    /// Encode the fixed header separately from the chunk's data.
+    pub fn encode_header(&self, committed: bool) -> [u8; Self::HEADER_SIZE] {
+        debug_assert!(!committed || self.require_ack);
+        let mut header = [0; Self::HEADER_SIZE];
+        header[0] = CHUNKED_ENVELOPE_MARKER;
+        header[1..17].copy_from_slice(&self.transfer_id);
+        header[17..21].copy_from_slice(&self.chunk_index.to_be_bytes());
+        header[21..25].copy_from_slice(&self.chunk_count.to_be_bytes());
+        header[25..29].copy_from_slice(&self.total_size.to_be_bytes());
+        header[29..61].copy_from_slice(&self.orig_content_id);
+        if self.require_ack {
+            header[61] |= CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK;
+        }
+        if committed {
+            header[61] |= CHUNKED_ENVELOPE_FLAG_COMMITTED;
+        }
+        header
     }
 
     /// Parse from wire bytes. Validates the marker and the structural bounds
