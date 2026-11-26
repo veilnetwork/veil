@@ -43,7 +43,7 @@ use std::sync::{
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use veil_cfg::NodeId;
 use veil_types::{NodeIdBytes, RelayOrder};
@@ -110,6 +110,7 @@ pub struct SessionTxRegistry {
     last_active: HashMap<NodeIdBytes, AtomicU64>,
     capacity: usize,
     latest_registration: u64,
+    session_changes: watch::Sender<()>,
     /// Cumulative count of frames dropped because a session channel was full.
     drops_total: Arc<AtomicU64>,
 }
@@ -136,6 +137,7 @@ impl Default for SessionTxRegistry {
             last_active: HashMap::new(),
             capacity: DEFAULT_TX_QUEUE_DEPTH,
             latest_registration: 0,
+            session_changes: watch::Sender::new(()),
             drops_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -209,6 +211,7 @@ impl SessionTxRegistry {
             last_active: HashMap::new(),
             capacity,
             latest_registration: 0,
+            session_changes: watch::Sender::new(()),
             drops_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -225,6 +228,7 @@ impl SessionTxRegistry {
             last_active: HashMap::new(),
             capacity,
             latest_registration: 0,
+            session_changes: watch::Sender::new(()),
             drops_total,
         }
     }
@@ -245,10 +249,14 @@ impl SessionTxRegistry {
             .iter()
             .filter_map(|(k, entry)| if entry.tx.is_closed() { Some(*k) } else { None })
             .collect();
+        if dead.is_empty() {
+            return;
+        }
         for k in dead {
             self.senders.remove(&k);
             self.last_active.remove(&k);
         }
+        self.session_changes.send_replace(());
     }
 
     /// Public wrapper for [`Self::prune_closed`].  Returns the number
@@ -293,6 +301,7 @@ impl SessionTxRegistry {
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
+        self.session_changes.send_replace(());
         rx
     }
 
@@ -321,6 +330,7 @@ impl SessionTxRegistry {
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
+        self.session_changes.send_replace(());
         rx
     }
 
@@ -356,6 +366,7 @@ impl SessionTxRegistry {
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
+        self.session_changes.send_replace(());
         Some(rx)
     }
 
@@ -462,6 +473,7 @@ impl SessionTxRegistry {
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
+        self.session_changes.send_replace(());
         Some(rx)
     }
 
@@ -473,6 +485,7 @@ impl SessionTxRegistry {
         if let Some(entry) = self.senders.remove(peer_id) {
             // Removing the map entry alone cannot close cloned producer senders.
             let _ = entry.retire.try_send(());
+            self.session_changes.send_replace(());
         }
         self.last_active.remove(peer_id);
     }
@@ -498,6 +511,7 @@ impl SessionTxRegistry {
             let _ = entry.retire.try_send(());
         }
         self.last_active.remove(peer_id);
+        self.session_changes.send_replace(());
         true
     }
 
@@ -1047,6 +1061,11 @@ impl SessionTxRegistry {
         self.latest_registration
     }
 
+    /// Wake local maintenance when a session is registered, replaced or removed.
+    pub fn subscribe_session_changes(&self) -> watch::Receiver<()> {
+        self.session_changes.subscribe()
+    }
+
     /// Is this exact authenticated session still the live owner? Callers that
     /// use this to replace an entry must retain the registry write lock across
     /// both this check and registration so a newer owner cannot interleave.
@@ -1061,14 +1080,17 @@ impl SessionTxRegistry {
     /// admission do not. It neither holds sender handles nor includes stale
     /// closed entries, and carries no protocol metadata.
     pub fn live_registration_snapshot(&self) -> Vec<(NodeIdBytes, u64)> {
-        let mut entries: Vec<_> = self
-            .senders
+        let mut entries: Vec<_> = self.live_registrations().collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// Iterate over live peers and their current registration witnesses.
+    pub fn live_registrations(&self) -> impl Iterator<Item = (NodeIdBytes, u64)> + '_ {
+        self.senders
             .iter()
             .filter(|(_, entry)| !entry.tx.is_closed())
             .map(|(peer, entry)| (*peer, entry.registration))
-            .collect();
-        entries.sort_unstable();
-        entries
     }
 
     pub fn len(&self) -> usize {
@@ -1208,6 +1230,9 @@ impl SessionTxRegistry {
             self.senders.remove(&peer_id);
             self.last_active.remove(&peer_id);
             evicted += 1;
+        }
+        if evicted != 0 {
+            self.session_changes.send_replace(());
         }
         evicted
     }

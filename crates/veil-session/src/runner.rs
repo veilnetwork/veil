@@ -3752,7 +3752,8 @@ pub fn mlkem_rekey_bytes_override() -> u64 {
     MLKEM_REKEY_BYTES_OVERRIDE.load(Ordering::Relaxed)
 }
 
-static MOBILE_BACKGROUND_TIER: AtomicU8 = AtomicU8::new(0);
+static MOBILE_BACKGROUND_TIER: std::sync::LazyLock<tokio::sync::watch::Sender<u8>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::Sender::new(0));
 static MOBILE_BACKGROUND_KEEPALIVE_MULTIPLIER: AtomicU32 = AtomicU32::new(1);
 
 /// connection-rotation **maximum** lifetime (seconds). `0` means
@@ -3805,7 +3806,18 @@ pub const MOBILE_ACTIVE_TIER_MULTIPLIER: u32 = 2;
 /// safely toward stretching keepalive rather than tight cadence).
 pub fn set_mobile_background_tier(tier: u8) {
     let clamped = tier.min(2);
-    MOBILE_BACKGROUND_TIER.store(clamped, Ordering::Relaxed);
+    MOBILE_BACKGROUND_TIER.send_if_modified(|current| {
+        if *current == clamped {
+            return false;
+        }
+        *current = clamped;
+        true
+    });
+}
+
+/// Subscribe to changes in the local mobile lifecycle tier.
+pub fn subscribe_mobile_background_tier() -> tokio::sync::watch::Receiver<u8> {
+    MOBILE_BACKGROUND_TIER.subscribe()
 }
 
 /// Legacy bool API — preserved for admin-command callers.
@@ -3832,7 +3844,7 @@ pub fn set_mobile_background_keepalive_multiplier(multiplier: u32) {
 /// and tests. Production callers use this via `mobile_status_provider.rs`
 /// to populate the IPC payload's `background_tier` byte.
 pub fn current_mobile_background_tier() -> u8 {
-    MOBILE_BACKGROUND_TIER.load(Ordering::Relaxed)
+    *MOBILE_BACKGROUND_TIER.borrow()
 }
 
 /// Resolved factor to apply to the keepalive interval right now.
@@ -3847,7 +3859,7 @@ pub fn current_mobile_background_keepalive_factor() -> u32 {
         // (non-mobile) deployments never see scaling.
         return 1;
     }
-    match MOBILE_BACKGROUND_TIER.load(Ordering::Relaxed) {
+    match current_mobile_background_tier() {
         0 => 1,
         1 => MOBILE_ACTIVE_TIER_MULTIPLIER,
         _ => multiplier,
@@ -3859,7 +3871,7 @@ pub fn current_mobile_background_keepalive_factor() -> u32 {
 /// `LowPower` — `Active` keeps maintenance running at stretched
 /// keepalive cadence so the routing table stays warm.
 pub fn should_suppress_background_maintenance() -> bool {
-    MOBILE_BACKGROUND_TIER.load(Ordering::Relaxed) == 2
+    current_mobile_background_tier() == 2
 }
 
 /// Read the configured background-keepalive multiplier.

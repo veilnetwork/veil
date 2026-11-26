@@ -14,10 +14,9 @@
 //! * `level < threshold_medium` → `scale_medium` (default 2×)
 //! * else → 1×
 //!
-//! The closure-based `maybe_recompute` API lets the caller defer the
-//! actual `local_battery_level` syscall (which on Linux walks
-//! `/sys/class/power_supply`) until the check interval is due AND
-//! makes the math unit-testable without a production-IO dependency.
+//! The closure-based `maybe_recompute` API reads the shared battery snapshot
+//! and background mode only when the check interval is due. Tests can supply
+//! their own readings.
 //!
 //! Sentinel initialisation:
 //! * `last_level = 255` (impossible real reading) → forces recompute

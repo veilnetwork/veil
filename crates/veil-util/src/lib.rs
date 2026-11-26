@@ -1110,29 +1110,86 @@ pub fn system_dns_config_readable(target_os: &str) -> bool {
 /// drain a desktop's wall power than over-aggressively slow a device
 /// that happens to not expose battery info.
 ///
-/// Phase 2 session 2 prep (veilcore extraction): canonicalized here
-/// so session crate can read battery state without a dep on veilcore
-/// (formerly lived in `veilcore/src/node/battery.rs`).
+/// The Linux reading is shared by the process and refreshed on demand at most
+/// once a minute.
 pub fn local_battery_level() -> u8 {
     #[cfg(target_os = "linux")]
     {
-        // Walk all BAT* entries and return the first readable capacity value.
-        if let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("BAT") {
-                    let cap_path = entry.path().join("capacity");
-                    if let Ok(s) = std::fs::read_to_string(&cap_path)
-                        && let Ok(v) = s.trim().parse::<u8>()
-                    {
-                        return v;
-                    }
-                }
+        static BATTERY: BatterySnapshot = BatterySnapshot(std::sync::Mutex::new(None));
+        BATTERY.level_at(std::time::Instant::now(), read_linux_battery_level)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        100
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct BatterySnapshot(std::sync::Mutex<Option<(std::time::Instant, u8)>>);
+
+#[cfg(any(target_os = "linux", test))]
+impl BatterySnapshot {
+    fn level_at(&self, now: std::time::Instant, read: impl FnOnce() -> u8) -> u8 {
+        let mut entry = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((sampled_at, level)) = *entry
+            && now.saturating_duration_since(sampled_at) < std::time::Duration::from_secs(60)
+        {
+            return level;
+        }
+        let level = read();
+        *entry = Some((now, level));
+        level
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_battery_level() -> u8 {
+    // Use the first readable BAT* capacity. Hosts without one report 100.
+    if let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("BAT")
+                && let Ok(value) = std::fs::read_to_string(entry.path().join("capacity"))
+                && let Ok(level) = value.trim().parse::<u8>()
+            {
+                return level;
             }
         }
     }
-    100 // default: assume full battery / no battery
+    100
+}
+
+#[cfg(test)]
+mod battery_snapshot_tests {
+    use super::BatterySnapshot;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn concurrent_battery_consumers_share_one_refresh() {
+        let snapshot = BatterySnapshot(Mutex::new(None));
+        let system_reads = AtomicUsize::new(0);
+        let start = Instant::now();
+        for (elapsed, expected, read_count) in [(0, 100, 1), (59, 100, 1), (60, 23, 2)] {
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        let level = snapshot.level_at(start + Duration::from_secs(elapsed), || {
+                            system_reads.fetch_add(1, Ordering::Relaxed);
+                            if elapsed == 0 { 100 } else { 23 }
+                        });
+                        assert_eq!(level, expected);
+                    });
+                }
+            });
+            assert_eq!(system_reads.load(Ordering::Relaxed), read_count);
+        }
+    }
 }
 
 // ── Poison-recovering lock macros ─────────────────────────────────────────────

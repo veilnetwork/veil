@@ -11,16 +11,106 @@
 //!
 //! Extracted from `runtime/mod.rs` during refactor.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use tokio::{sync::watch, time::Instant};
 use veil_util::{lock, rlock};
 
 use rand_core::{OsRng, RngCore};
 
-use crate::types::{NodeId, NodeIdBytes};
+use crate::types::NodeId;
 use veil_routing::RttTable;
+use veil_session::tx_registry::SessionTxRegistry;
 
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
+
+async fn run_route_probes(
+    registry: Arc<RwLock<SessionTxRegistry>>,
+    rtt_table: Arc<Mutex<RttTable>>,
+    mut shutdown: watch::Receiver<bool>,
+    mut background_tier: watch::Receiver<u8>,
+    mobile: veil_cfg::MobileConfig,
+    probe_interval: impl Fn(f64) -> Duration,
+) {
+    let mut session_changes = rlock!(registry).subscribe_session_changes();
+    let mut next_probe = HashMap::new();
+    let mut probe_id = 0_u32;
+    let clock_start = Instant::now();
+
+    while !*shutdown.borrow() {
+        let paused = *background_tier.borrow_and_update() == 2;
+        let mut deadline = None;
+        if !paused {
+            // Mark before taking the snapshot so a concurrent registration
+            // either appears in the snapshot or wakes the next iteration.
+            session_changes.mark_unchanged();
+            let peers = {
+                let registry = rlock!(registry);
+                next_probe.retain(|peer, _| registry.has_session(peer));
+                registry.live_registrations().collect::<Vec<_>>()
+            };
+            let now = Instant::now();
+            let mut battery_multiplier = None;
+
+            for (peer, registration) in peers {
+                if next_probe.get(&peer).is_some_and(|due| now < *due) {
+                    continue;
+                }
+                let multiplier = *battery_multiplier.get_or_insert_with(|| {
+                    if mobile.low_battery_threshold_pct.is_some() {
+                        mobile.battery_multiplier(crate::runtime::local_battery_level())
+                    } else {
+                        1
+                    }
+                });
+                let stability = lock!(rtt_table)
+                    .get(&peer)
+                    .map_or(f64::MAX, |rtt| rtt.stability());
+                let interval = probe_interval(stability).saturating_mul(multiplier);
+
+                // Keep the previous one-second resolution so many staggered
+                // peers can share one wakeup without sending a probe early.
+                let jitter_range_ms = (interval.as_millis() as u64) / 5;
+                let jitter_ms = (OsRng.next_u64() % (jitter_range_ms + 1)) as i64
+                    - (jitter_range_ms / 2) as i64;
+                let interval_ms = (interval.as_millis() as i64 + jitter_ms).max(1000) as u64;
+                let elapsed = now.duration_since(clock_start) + Duration::from_millis(interval_ms);
+                let seconds = elapsed.as_secs() + u64::from(elapsed.subsec_nanos() != 0);
+                let registry = rlock!(registry);
+                if registry.live_registration(&peer) == Some(registration) {
+                    next_probe.insert(peer, clock_start + Duration::from_secs(seconds));
+                    probe_id = probe_id.wrapping_add(1);
+                    registry.send_to(
+                        &peer,
+                        veil_proto::priority::INTERACTIVE,
+                        NodeRuntime::build_route_probe_frame(probe_id),
+                    );
+                }
+            }
+            deadline = next_probe.values().copied().min();
+        }
+
+        tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() { break; }
+            }
+            result = background_tier.changed() => {
+                if result.is_err() { break; }
+            }
+            _ = session_changes.changed(), if !paused => {}
+            _ = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+}
 
 impl NodeRuntime {
     /// Spawn a background task that evicts expired PoW challenge entries.
@@ -237,7 +327,7 @@ impl NodeRuntime {
     /// Used for the immediate startup probe and by the
     /// periodic probe scheduler. `probe_id = 0` is used for one-shot probes
     /// where we don't need to correlate the reply.
-    fn build_route_probe_frame() -> Vec<u8> {
+    fn build_route_probe_frame(probe_id: u32) -> Vec<u8> {
         use veil_proto::{
             codec::encode_header,
             control::RouteProbePayload,
@@ -249,7 +339,7 @@ impl NodeRuntime {
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         let payload = RouteProbePayload {
-            probe_id: 0,
+            probe_id,
             timestamp_ms,
         };
         let body = payload.encode();
@@ -280,7 +370,7 @@ impl NodeRuntime {
         rlock!(tx_registry).send_to(
             peer_id.as_bytes(),
             veil_proto::priority::INTERACTIVE,
-            Self::build_route_probe_frame(),
+            Self::build_route_probe_frame(0),
         );
     }
 
@@ -292,137 +382,37 @@ impl NodeRuntime {
     /// random jitter is applied to prevent synchronised probe bursts when many
     /// peers are added at the same time.
     ///
-    /// when `mobile.low_battery_threshold_pct` is configured
-    /// and the local battery is at-or-below the threshold, every per-peer
-    /// interval is multiplied by `mobile.low_battery_multiplier` so the
-    /// node stops draining the device while still keeping enough
-    /// liveness signal for the network to notice we exist. The battery
-    /// is sampled once per outer-loop tick (1 s) so the throttle reacts
-    /// to a charger plug-in within ~1 s.
+    /// Probe cadence is adjusted for the configured low-battery threshold.
+    /// In LowPower, only a tier change or shutdown wakes the task.
     pub fn spawn_route_probe_task_with(
         &mut self,
-        min_interval: std::time::Duration,
-        max_interval: std::time::Duration,
+        min_interval: Duration,
+        max_interval: Duration,
         stability_threshold: f64,
         mobile: veil_cfg::MobileConfig,
     ) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        let session_tx_registry = Arc::clone(&self.session_tx_registry);
-        let rtt_table = self.control_plane.rtt_table();
-        let handle = supervised_spawn(Arc::clone(&self.logger), "route_probe", async move {
-            use std::collections::HashMap;
-            use std::time::Instant;
-            use veil_proto::{
-                codec::encode_header,
-                control::RouteProbePayload,
-                family::{ControlMsg, FrameFamily},
-                header::FrameHeader,
-            };
-
-            // Per-peer next-probe deadline.
-            let mut next_probe: HashMap<NodeIdBytes, Instant> = HashMap::new();
-            let mut probe_id: u32 = 0;
-
-            // Tick every second to check per-peer deadlines.
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    Ok(_) = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() { break; }
-                    }
-                    _ = interval.tick() => {}
-                }
-
-                let now = Instant::now();
-
-                // follow-up: skip route-probe loop entirely
-                // on LowPower tier (Doze / iOS BackgroundTask). Probe
-                // traffic costs ~50-200 B per peer per ~30 s — modest on
-                // its own, but on a phone in Doze EVERY background
-                // wake-up shortens battery life, and route freshness is
-                // not load-bearing while the user can't observe it.
-                // Foreground / Active tiers continue probing normally.
-                if veil_session::runner::should_suppress_background_maintenance() {
-                    continue;
-                }
-
-                let peer_ids = rlock!(session_tx_registry).peer_ids();
-
-                // sample battery once per outer tick (cheap;
-                // single file read on Linux, no-op elsewhere). When
-                // mobile config is at defaults this is a no-op multiplier
-                // path, so the cost of the sample is paid only when the
-                // operator opted in to mobile mode.
-                let battery_mult = if mobile.low_battery_threshold_pct.is_some() {
-                    mobile.battery_multiplier(crate::runtime::local_battery_level())
-                } else {
-                    1
-                };
-
-                for peer_id in peer_ids {
-                    // Check deadline.
-                    let due = next_probe.get(&peer_id).copied().unwrap_or(now);
-                    if now < due {
-                        continue;
-                    }
-
-                    // Determine adaptive interval for this peer.
-                    let stability = lock!(rtt_table)
-                        .get(&peer_id)
-                        .map(|p| p.stability())
-                        .unwrap_or(f64::MAX);
-                    let base = Self::adaptive_probe_interval(
+        let handle = supervised_spawn(
+            Arc::clone(&self.logger),
+            "route_probe",
+            run_route_probes(
+                Arc::clone(&self.session_tx_registry),
+                self.control_plane.rtt_table(),
+                shutdown_tx.subscribe(),
+                veil_session::runner::subscribe_mobile_background_tier(),
+                mobile,
+                move |stability| {
+                    Self::adaptive_probe_interval(
                         stability,
                         stability_threshold,
                         min_interval,
                         max_interval,
-                    );
-                    // stretch the interval by the
-                    // battery-aware multiplier (1 = no throttle when
-                    // disabled / above-threshold / on AC).
-                    let throttled = base.saturating_mul(battery_mult);
-                    // Apply ±10 % jitter to avoid synchronised probe bursts.
-                    let jitter_range_ms = (throttled.as_millis() as u64) / 5; // 20% total range
-                    let rnd = OsRng.next_u64();
-                    let jitter_ms =
-                        (rnd % (jitter_range_ms + 1)) as i64 - (jitter_range_ms / 2) as i64;
-                    let interval_ms = (throttled.as_millis() as i64 + jitter_ms).max(1000) as u64;
-                    next_probe.insert(peer_id, now + std::time::Duration::from_millis(interval_ms));
-
-                    // Build and send the probe.
-                    probe_id = probe_id.wrapping_add(1);
-                    let timestamp_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                        .unwrap_or(0);
-                    let payload = RouteProbePayload {
-                        probe_id,
-                        timestamp_ms,
-                    };
-                    let body = payload.encode();
-                    let mut hdr =
-                        FrameHeader::new(FrameFamily::Control as u8, ControlMsg::RouteProbe as u16);
-                    hdr.body_len = body.len() as u32;
-                    hdr.set_priority(veil_proto::priority::INTERACTIVE);
-                    let mut frame = encode_header(&hdr).to_vec();
-                    frame.extend_from_slice(&body);
-
-                    rlock!(session_tx_registry).send_to(
-                        &peer_id,
-                        veil_proto::priority::INTERACTIVE,
-                        frame,
-                    );
-                }
-
-                // Clean up departed peers from the deadline map.
-                next_probe.retain(|_, deadline| now < *deadline + max_interval * 2);
-            }
-        });
+                    )
+                },
+            ),
+        );
         lock_tasks(&self.tasks).sessions.push(handle);
     }
 
@@ -543,5 +533,81 @@ impl NodeRuntime {
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);
+    }
+}
+
+#[cfg(test)]
+mod route_probe_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Wake, Waker};
+    use veil_util::wlock;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_probes_wait_for_a_peer_deadline_or_foreground() {
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let rtt = Arc::new(Mutex::new(RttTable::new(Duration::from_secs(60))));
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (tier, tier_rx) = watch::channel(0);
+        let mut task = std::pin::pin!(run_route_probes(
+            Arc::clone(&registry),
+            rtt,
+            shutdown_rx,
+            tier_rx,
+            veil_cfg::MobileConfig::default(),
+            |_| Duration::from_millis(100),
+        ));
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "idle without peers");
+
+        let mut first = wlock!(registry).register([1; 32]);
+        assert!(wakes.0.load(Ordering::Relaxed) > 0);
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            first.try_recv().is_ok(),
+            "new peer is probed on registration"
+        );
+
+        tier.send_replace(2);
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        wakes.0.store(0, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(120)).await;
+        let mut second = wlock!(registry).register([2; 32]);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "idle in LowPower");
+        assert!(first.try_recv().is_err());
+        assert!(second.try_recv().is_err());
+
+        tier.send_replace(0);
+        assert!(wakes.0.load(Ordering::Relaxed) > 0);
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        assert!(first.try_recv().is_ok(), "overdue probe after resuming");
+        assert!(second.try_recv().is_ok(), "peer added while paused");
+
+        wakes.0.store(0, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "before the deadline");
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(wakes.0.load(Ordering::Relaxed) > 0);
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        assert!(first.try_recv().is_ok());
+        assert!(second.try_recv().is_ok());
+
+        shutdown.send_replace(true);
+        assert!(task.as_mut().poll(&mut cx).is_ready());
     }
 }
