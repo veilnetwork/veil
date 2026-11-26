@@ -55,7 +55,7 @@ use veil_proto::mlkem_cert::MlKemKeyCert;
 use veil_proto::relay_key::RelayKeyRecord;
 use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
 use veil_session::SessionTxRegistry;
-use veil_types::{MlKemEkResolver, NodeIdBytes, RelayKeyResolver};
+use veil_types::{MlKemEkResolver, NodeIdBytes, PeerLruCache, RelayKeyResolver};
 use veil_util::{lock, rlock, wlock};
 
 use crate::mlkem_cert_store::{CertRecall, MlKemCertStore};
@@ -263,6 +263,8 @@ pub struct DhtMlKemEkResolver {
     /// Documents already checked by this resolver. A certificate TTL is not
     /// permission to ignore a newer signed revocation in the local DHT.
     checked_documents: Mutex<std::collections::HashMap<NodeIdBytes, CheckedDocument>>,
+    /// Successful signature checks for the current local registry bytes.
+    checked_registries: Mutex<PeerLruCache<CheckedRegistry>>,
     /// Only overlapping full-document requests share a replica walk. Every
     /// caller independently verifies the candidates and its durable host floor.
     document_walks: Mutex<ReplicaWalks>,
@@ -288,6 +290,12 @@ pub struct DhtMlKemEkResolver {
 
 struct CheckedDocument {
     digest: [u8; 32],
+}
+
+struct CheckedRegistry {
+    digest: blake3::Hash,
+    signing_key: [u8; 32],
+    registry: Arc<InstanceRegistry>,
 }
 
 /// What one certificate walk is for: a node, and the device of it when a
@@ -645,6 +653,9 @@ impl DhtMlKemEkResolver {
             step_timeout: DEFAULT_STEP_TIMEOUT,
             cert_ttl: CERT_CACHE_TTL,
             checked_documents: Mutex::new(std::collections::HashMap::new()),
+            checked_registries: Mutex::new(PeerLruCache::with_capacity(
+                veil_proto::budget::MAX_PEER_MLKEM_CACHE,
+            )),
             document_walks: Mutex::new(ReplicaWalks::new()),
             record_walks: Mutex::new(ReplicaWalks::new()),
             instance_walk_gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -2442,6 +2453,40 @@ fn lru_insert<K: Eq + std::hash::Hash + Copy, V>(
 }
 
 impl DhtMlKemEkResolver {
+    /// The caller must observe the current document before using this proof.
+    /// The cache remembers only the signature check, so it cannot authorize a
+    /// certificate that the document or its shared authorization floor rejects.
+    fn verified_local_registry(&self, doc: &IdentityDocument) -> Option<Arc<InstanceRegistry>> {
+        let bytes = self
+            .dht
+            .get_local(&InstanceRegistry::dht_key(&doc.node_id))?;
+        // Include the signature itself, so changing it also forces verification.
+        let digest = blake3::hash(&bytes);
+        if let Some(checked) = lock!(self.checked_registries).get(&doc.node_id)
+            && checked.digest == digest
+            && registry_signing_key(&checked.registry, doc) == Some(&checked.signing_key)
+        {
+            return Some(Arc::clone(&checked.registry));
+        }
+
+        let registry = InstanceRegistry::decode(&bytes).ok()?;
+        let signing_key = *registry_signing_key(&registry, doc)?;
+        if registry.node_id != doc.node_id || !verify_instance_registry_sig(&registry, doc) {
+            return None;
+        }
+        let registry = Arc::new(registry);
+        lock!(self.checked_registries).insert_lru(
+            doc.node_id,
+            CheckedRegistry {
+                digest,
+                signing_key,
+                registry: Arc::clone(&registry),
+            },
+            veil_proto::budget::MAX_PEER_MLKEM_CACHE,
+        );
+        Some(registry)
+    }
+
     /// The whole verified certificate from local records only — the sync
     /// counterpart of [`fetch_verified_cert`](Self::fetch_verified_cert).
     fn cached_cert(&self, target_node_id: [u8; 32]) -> Option<VerifiedMlkemCert> {
@@ -2476,15 +2521,7 @@ impl DhtMlKemEkResolver {
             return None;
         }
 
-        let registry = InstanceRegistry::decode(
-            &self
-                .dht
-                .get_local(&InstanceRegistry::dht_key(&target_node_id))?,
-        )
-        .ok()?;
-        if registry.node_id != target_node_id || !verify_instance_registry_sig(&registry, &doc) {
-            return None;
-        }
+        let registry = self.verified_local_registry(&doc)?;
         let instance = registry
             .instances
             .iter()
@@ -2616,16 +2653,9 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
         if doc.node_id != target || !self.observe_document(&doc) {
             return Vec::new();
         }
-        let Some(reg) = self
-            .dht
-            .get_local(&InstanceRegistry::dht_key(&target))
-            .and_then(|bytes| InstanceRegistry::decode(&bytes).ok())
-        else {
+        let Some(reg) = self.verified_local_registry(&doc) else {
             return Vec::new();
         };
-        if reg.node_id != target || !verify_instance_registry_sig(&reg, &doc) {
-            return Vec::new();
-        }
         reg.instances
             .iter()
             .filter_map(|entry| {
@@ -2735,14 +2765,7 @@ impl RelayKeyResolver for DhtMlKemEkResolver {
 /// active subkey indexed by `signing_identity_key_idx`.  Returns `true`
 /// iff the signature is valid AND the subkey is present.
 fn verify_instance_registry_sig(reg: &InstanceRegistry, doc: &IdentityDocument) -> bool {
-    let key_idx = reg.signing_identity_key_idx as usize;
-    let Some(subkey) = doc.identity_keys.get(key_idx) else {
-        return false;
-    };
-    // Only Ed25519 subkeys can sign a registry under v1 wire format.
-    // (Falcon-512 subkeys exist but the registry was never specified to
-    // carry a Falcon sig.  If a future epic lifts that, expand here.)
-    let Ok(pk_arr) = subkey.pubkey.as_slice().try_into() as Result<&[u8; 32], _> else {
+    let Some(pk_arr) = registry_signing_key(reg, doc) else {
         return false;
     };
     let Ok(pk) = EdVerifyingKey::from_bytes(pk_arr) else {
@@ -2755,6 +2778,19 @@ fn verify_instance_registry_sig(reg: &InstanceRegistry, doc: &IdentityDocument) 
         return false;
     };
     pk.verify(&msg, &sig).is_ok()
+}
+
+/// The v1 registry uses the 32-byte Ed25519 subkey named by its signed index.
+fn registry_signing_key<'a>(
+    reg: &InstanceRegistry,
+    doc: &'a IdentityDocument,
+) -> Option<&'a [u8; 32]> {
+    doc.identity_keys
+        .get(reg.signing_identity_key_idx as usize)?
+        .pubkey
+        .as_slice()
+        .try_into()
+        .ok()
 }
 
 /// Instance-certificate walks running right now, across every resolver.
@@ -5282,6 +5318,20 @@ mod tests {
         assert_eq!(pairs[0].0, device);
         assert_eq!(pairs[0].1.instance_id, instance);
         assert_eq!(resolver.identity_hint_for_device(&device), Some(target));
+        let verified = resolver.verified_local_registry(&s.doc).unwrap();
+        assert!(Arc::ptr_eq(
+            &verified,
+            &resolver.verified_local_registry(&s.doc).unwrap()
+        ));
+        let mut rotated = s.doc.clone();
+        rotated.identity_keys[0].pubkey = SigningKey::from_bytes(&[0xa5; 32])
+            .verifying_key()
+            .to_bytes()
+            .into();
+        assert!(
+            resolver.verified_local_registry(&rotated).is_none(),
+            "the same registry bytes must verify again under a different key"
+        );
         let (_, host_state) = resolver.cert_store.export_peer_authorization().unwrap();
         let restored_store = Arc::new(MlKemCertStore::ephemeral());
         restored_store
@@ -5293,6 +5343,21 @@ mod tests {
         assert!(
             cold.resolve_device_certs_cached(target).is_empty(),
             "the persisted hint alone is not a current certificate"
+        );
+        registry.reg_version += 1;
+        dht.store_local(InstanceRegistry::dht_key(&target), registry.encode());
+        assert!(resolver.resolve_device_certs_cached(target).is_empty());
+        let mut msg = INSTANCE_REGISTRY_SIG_CONTEXT.to_vec();
+        msg.extend_from_slice(&registry.canonical_signing_bytes());
+        registry.sig = sk.sign(&msg).to_bytes().to_vec();
+        dht.store_local(InstanceRegistry::dht_key(&target), registry.encode());
+        assert_eq!(resolver.resolve_device_certs_cached(target), pairs);
+        assert_eq!(
+            resolver
+                .verified_local_registry(&s.doc)
+                .unwrap()
+                .reg_version,
+            registry.reg_version
         );
         registry.sig[0] ^= 1;
         dht.store_local(InstanceRegistry::dht_key(&target), registry.encode());
