@@ -4252,34 +4252,43 @@ fn padded_wire_len(real_wire_len: usize) -> usize {
 /// handshake), padding is globally disabled via [`set_padding_enabled`], or no
 /// bucket fits, the wire is returned unchanged.
 pub fn coalesce_with_padding(real_wire: &[u8], tx_cipher: Option<&mut SessionCipher>) -> Vec<u8> {
+    let capacity = if tx_cipher.is_some() {
+        padded_wire_len(real_wire.len())
+    } else {
+        real_wire.len()
+    };
+    let mut wire = Vec::with_capacity(capacity);
+    wire.extend_from_slice(real_wire);
+    append_wire_padding(&mut wire, tx_cipher);
+    wire
+}
+
+fn append_wire_padding(wire: &mut Vec<u8>, tx_cipher: Option<&mut SessionCipher>) {
     if !padding_enabled() {
-        return real_wire.to_vec();
+        return;
     }
     let Some(cipher) = tx_cipher else {
-        return real_wire.to_vec();
+        return;
     };
-    let Some(bucket) = pick_tls_bucket(real_wire.len()) else {
-        return real_wire.to_vec();
+    let Some(bucket) = pick_tls_bucket(wire.len()) else {
+        return;
     };
-    if real_wire.len() == bucket {
-        return real_wire.to_vec();
+    if wire.len() == bucket {
+        return;
     }
-    let pad_target = bucket - real_wire.len();
+    let pad_target = bucket - wire.len();
     let Some(pad_wire) = build_padding_wire(pad_target, cipher) else {
-        return real_wire.to_vec();
+        return;
     };
     debug_assert_eq!(
-        real_wire.len() + pad_wire.len(),
+        wire.len() + pad_wire.len(),
         bucket,
         "padding size calculation mismatch: real={}, pad={}, bucket={}",
-        real_wire.len(),
+        wire.len(),
         pad_wire.len(),
         bucket,
     );
-    let mut combined = Vec::with_capacity(bucket);
-    combined.extend_from_slice(real_wire);
-    combined.extend_from_slice(&pad_wire);
-    combined
+    wire.extend_from_slice(&pad_wire);
 }
 
 impl SessionRunner {
@@ -6337,7 +6346,7 @@ impl SessionRunner {
                         .tx_cipher
                         .as_mut()
                         .expect("encrypted pass must retain its TX cipher");
-                    let mut encrypted_batch = Vec::with_capacity(encrypted_batch_wire_len);
+                    let mut encrypted_batch = Vec::with_capacity(planned_wire_len);
                     for frame in &encrypted_batch_frames {
                         let enc = match apply_tx_cipher(frame, cipher) {
                             Some(enc) => enc,
@@ -6352,9 +6361,9 @@ impl SessionRunner {
                     // One standard HTTPS-sized bucket for the concatenated real
                     // frames. The receiver already parses consecutive encrypted
                     // OVL1 frames, then silently consumes the final padding frame.
-                    let wire = coalesce_with_padding(&encrypted_batch, Some(cipher));
-                    let tx_len = wire.len() as u64;
-                    let wire_pool = veil_bufpool::pooled_shared_from_vec(wire);
+                    append_wire_padding(&mut encrypted_batch, Some(cipher));
+                    let tx_len = encrypted_batch.len() as u64;
+                    let wire_pool = veil_bufpool::pooled_shared_from_vec(encrypted_batch);
                     if Self::push_wire_classified(
                         &wire_tx,
                         wire_pool,
@@ -7745,7 +7754,7 @@ mod m1_empty_frame_aead_tests {
         let key = [0x22u8; 32];
         let mut tx = SessionCipher::new(&key, true);
         let bodies = [vec![0xA1; 300], vec![0xB2; 300], vec![0xC3; 300]];
-        let mut real_batch = Vec::new();
+        let mut wire = Vec::with_capacity(1300);
 
         for (i, body) in bodies.iter().enumerate() {
             let mut hdr = FrameHeader::new(FrameFamily::Control as u8, i as u16 + 1);
@@ -7753,10 +7762,12 @@ mod m1_empty_frame_aead_tests {
             let mut frame = encode_header(&hdr).to_vec();
             frame.extend_from_slice(body);
             let sealed = apply_tx_cipher(&frame, &mut tx).expect("seal real frame");
-            real_batch.extend_from_slice(&sealed);
+            wire.extend_from_slice(&sealed);
         }
 
-        let wire = coalesce_with_padding(&real_batch, Some(&mut tx));
+        let allocated = wire.as_ptr();
+        append_wire_padding(&mut wire, Some(&mut tx));
+        assert_eq!(wire.as_ptr(), allocated);
         assert_eq!(wire.len(), 1300, "three small real frames share one bucket");
 
         let mut rx = SessionCipher::new(&key, true);
