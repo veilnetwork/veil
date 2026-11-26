@@ -3170,6 +3170,9 @@ impl FrameDispatcher {
                     // time out and either retry or surface the failure.
                     use veil_proto::budget::MAX_PENDING_RECURSIVE;
                     let mut m = lock!(self.pending_recursive);
+                    if p.tx.is_closed() {
+                        return DispatchResult::NoResponse;
+                    }
                     if m.len() < MAX_PENDING_RECURSIVE {
                         m.insert(resp.query_id, p);
                     } else {

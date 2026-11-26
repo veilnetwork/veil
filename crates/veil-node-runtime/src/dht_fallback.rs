@@ -1,7 +1,7 @@
 //! iterative-DHT route-discovery fallback.
 //!
-//! When `miss_handler`'s legacy `RouteRequest` flood (TTL=7) exhausts its
-//! retry budget without finding a route to `target`, this module fires a
+//! When `miss_handler`'s legacy `RouteRequest` flood (TTL=7) has found no
+//! route to `target`, this module fires a
 //! `RecursiveQuery(FIND_NODE, target_key=target)` for target and waits for
 //! the signed `RecursiveResponse` to come back. Dispatcher's
 //! `handle_recursive_response` populates `route_cache` from the returned
@@ -68,6 +68,19 @@ use veil_proto::codec::encode_header;
 use veil_proto::family::{FrameFamily, RoutingMsg};
 use veil_proto::header::{FrameHeader, priority};
 use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
+
+/// An overlapping lookup can lose to a route that is already available.
+/// Release its pending slot on cancellation as well as on timeout.
+struct PendingFindNode<'a> {
+    queries: &'a Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>,
+    query_id: [u8; 16],
+}
+
+impl Drop for PendingFindNode<'_> {
+    fn drop(&mut self) {
+        lock!(self.queries).remove(&self.query_id);
+    }
+}
 
 /// Sliding-window size for adaptive-timeout outcome tracking.
 /// 20 is a balance between fast reaction to topology change and stability
@@ -248,9 +261,13 @@ impl IterativeDhtFallback for DhtRouteFallback {
             // hops=2. So even if our oneshot times out, the cache
             // may still have been seeded by partial responses from
             // intermediate forwarders along the path.
+            let queries = &services.dispatcher.pending_recursive;
+            // Declare the guard before the channel so cancellation closes
+            // the receiver before releasing the pending query.
+            let _pending;
             let (tx, rx) = oneshot::channel::<Vec<u8>>();
             {
-                let mut m = lock!(services.dispatcher.pending_recursive);
+                let mut m = lock!(queries);
                 m.retain(|_, p| !p.tx.is_closed());
                 if m.len() >= MAX_PENDING_RECURSIVE {
                     self.record_outcome(false);
@@ -264,6 +281,7 @@ impl IterativeDhtFallback for DhtRouteFallback {
                         tx,
                     },
                 );
+                _pending = PendingFindNode { queries, query_id };
             }
 
             // Pick top-2 closest active session peers (sorted by XOR

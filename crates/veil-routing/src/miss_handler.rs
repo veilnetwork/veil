@@ -38,8 +38,8 @@ use crate::{RoutingLogger, RoutingMetrics};
 
 /// iterative-DHT fallback.
 ///
-/// When the legacy `RouteRequest` flood (TTL=7) exhausts its retries without
-/// finding a route, the miss-handler can optionally invoke this trait to fire
+/// When the legacy `RouteRequest` flood (TTL=7) has found no route, the
+/// miss-handler can optionally invoke this trait to fire
 /// a Kademlia-style `RecursiveQuery(FIND_NODE)` for the target. The dispatcher
 /// seeds the returned contacts into `route_cache` as candidate next-hops; the
 /// miss-handler's second `wait_for_route` round picks any of them up.
@@ -252,64 +252,101 @@ async fn lookup_one(ctx: &LookupCtx, dst: [u8; 32], priority: u8) {
         discovery_paths,
     );
 
+    // Give a nearby signed route a short head start. A relay cannot tell a
+    // call apart from other forwarded user traffic, so the overlap uses the
+    // existing class and does not add a call-specific signal or queue.
+    let overlap = flooded
+        && iterative_dht_fallback.is_some()
+        && matches!(
+            priority,
+            veil_proto::priority::REALTIME | veil_proto::priority::INTERACTIVE
+        );
+    let [first, second, third] = *route_request_backoff_ms;
+    let initial_wait = if overlap {
+        [first, 0, 0]
+    } else {
+        *route_request_backoff_ms
+    };
     let mut found = if flooded {
-        wait_for_route(&dst, route_cache, route_updated, *route_request_backoff_ms).await
+        wait_for_route(&dst, route_cache, route_updated, initial_wait).await
     } else {
         false
     };
 
-    // iterative-DHT fallback. Triggered ONLY if
-    // legacy `RouteRequest` flood exhausted its retries without a route.
-    // Behaviour-preserving: `None` skips this block entirely and we
-    // record the partition event below.
     if !found && let Some(fallback) = iterative_dht_fallback.as_ref() {
-        logger.info(
-            "route.dht_fallback.start",
-            &format!("target={}", hex_short_8(&dst)),
-        );
-        if let Some(m) = metrics {
-            m.inc_dht_fallback_triggered();
-        }
-        let oneshot_ok = fallback.try_seed_route_via_find_node(dst, priority).await;
-        // Re-check the route cache REGARDLESS of the oneshot result.
-        // `oneshot_ok` only reflects whether our RecursiveResponse
-        // oneshot fired; but the dispatcher ALSO seeds candidate
-        // next-hops into route_cache from PARTIAL recursive responses
-        // that arrive along the path (see DhtRouteFallback docs). So
-        // a route can recover even when the oneshot timed out.
-        // Counting `resolved`/`miss` off the oneshot (as before)
-        // under-counted real recoveries and mislabeled them as
-        // partitions. Tie the outcome to whether a route actually
-        // appeared instead. On oneshot success, give the seeded
-        // route a brief window to settle; on oneshot miss, any seed
-        // already arrived during the timeout, so an immediate check
-        // adds no latency to the (already-slow) miss path.
-        found = if oneshot_ok {
-            wait_for_route(&dst, route_cache, route_updated, *route_request_backoff_ms).await
-        } else {
-            rlock!(route_cache).lookup(&dst).is_some()
+        let dht = async {
+            logger.info(
+                "route.dht_fallback.start",
+                &format!("target={}", hex_short_8(&dst)),
+            );
+            if let Some(m) = metrics {
+                m.inc_dht_fallback_triggered();
+            }
+            fallback.try_seed_route_via_find_node(dst, priority).await
         };
-        if found {
-            if let Some(m) = metrics {
-                m.inc_dht_fallback_resolved();
+        let outcome = if overlap {
+            let legacy = wait_for_route(&dst, route_cache, route_updated, [second, third, 0]);
+            tokio::pin!(dht, legacy);
+            tokio::select! {
+                ready = &mut legacy => {
+                    if ready { None } else { Some(dht.await) }
+                }
+                ok = &mut dht => {
+                    // An early DHT refusal still leaves the original
+                    // remaining window available for the signed response.
+                    let already_learned = rlock!(route_cache).lookup(&dst).is_some();
+                    if !ok && !already_learned && legacy.await {
+                        None
+                    } else {
+                        Some(ok)
+                    }
+                }
             }
-            logger.info(
-                "route.dht_fallback.resolved",
-                &format!(
-                    "target={} oneshot={} cache_seeded={}",
-                    hex_short_8(&dst),
-                    oneshot_ok,
-                    !oneshot_ok
-                ),
-            );
         } else {
-            if let Some(m) = metrics {
-                m.inc_dht_fallback_miss();
+            Some(dht.await)
+        };
+        found = true;
+        if let Some(oneshot_ok) = outcome {
+            // Re-check the route cache REGARDLESS of the oneshot result.
+            // `oneshot_ok` only reflects whether our RecursiveResponse
+            // oneshot fired; but the dispatcher ALSO seeds candidate
+            // next-hops into route_cache from PARTIAL recursive responses
+            // that arrive along the path (see DhtRouteFallback docs). So
+            // a route can recover even when the oneshot timed out.
+            // Counting `resolved`/`miss` off the oneshot (as before)
+            // under-counted real recoveries and mislabeled them as
+            // partitions. Tie the outcome to whether a route actually
+            // appeared instead. On oneshot success, give the seeded
+            // route a brief window to settle; on oneshot miss, any seed
+            // already arrived during the timeout, so an immediate check
+            // adds no latency to the (already-slow) miss path.
+            found = if oneshot_ok {
+                wait_for_route(&dst, route_cache, route_updated, *route_request_backoff_ms).await
+            } else {
+                rlock!(route_cache).lookup(&dst).is_some()
+            };
+            if found {
+                if let Some(m) = metrics {
+                    m.inc_dht_fallback_resolved();
+                }
+                logger.info(
+                    "route.dht_fallback.resolved",
+                    &format!(
+                        "target={} oneshot={} cache_seeded={}",
+                        hex_short_8(&dst),
+                        oneshot_ok,
+                        !oneshot_ok
+                    ),
+                );
+            } else {
+                if let Some(m) = metrics {
+                    m.inc_dht_fallback_miss();
+                }
+                logger.info(
+                    "route.dht_fallback.miss",
+                    &format!("target={} oneshot={}", hex_short_8(&dst), oneshot_ok),
+                );
             }
-            logger.info(
-                "route.dht_fallback.miss",
-                &format!("target={} oneshot={}", hex_short_8(&dst), oneshot_ok),
-            );
         }
     }
 
@@ -525,9 +562,15 @@ mod tests {
         starts: mpsc::UnboundedReceiver<[u8; 32]>,
         held: Arc<HeldFallback>,
         broadcaster: Arc<CapturingBroadcaster>,
+        cache: Arc<RwLock<RouteCache>>,
+        updated: Arc<Notify>,
     }
 
     fn held_handler() -> HeldHandler {
+        held_handler_with_backoff([0; 3])
+    }
+
+    fn held_handler_with_backoff(backoff: [u64; 3]) -> HeldHandler {
         let (tx, rx) = mpsc::channel(32);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (entered, starts) = mpsc::unbounded_channel();
@@ -538,18 +581,20 @@ mod tests {
             peak: Arc::new(AtomicU64::new(0)),
         });
         let broadcaster = Arc::new(CapturingBroadcaster::default());
+        let cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));
+        let updated = Arc::new(Notify::new());
         let handle = spawn(MissHandlerCtx {
             shutdown_rx,
             rx,
             broadcaster: broadcaster.clone(),
-            route_cache: Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60)))),
-            route_updated: Arc::new(Notify::new()),
+            route_cache: cache.clone(),
+            route_updated: updated.clone(),
             local_node_id: [0; 32],
             signing_key: None,
             discovery_paths: Arc::new(Mutex::new(Default::default())),
             metrics: None,
             logger: Arc::new(NoopLogger),
-            route_request_backoff_ms: [0; 3],
+            route_request_backoff_ms: backoff,
             partition_threshold: 0.5,
             iterative_dht_fallback: Some(held.clone()),
         });
@@ -560,7 +605,65 @@ mod tests {
             starts,
             held,
             broadcaster,
+            cache,
+            updated,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_miss_starts_dht_after_the_first_window_and_can_cancel_it() {
+        use veil_proto::priority::INTERACTIVE;
+        let HeldHandler {
+            input,
+            shutdown,
+            task,
+            mut starts,
+            held,
+            broadcaster,
+            cache,
+            updated,
+        } = held_handler_with_backoff([500, 1000, 2000]);
+        let target = [0x51; 32];
+        input.send((target, INTERACTIVE)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(499), starts.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(broadcaster.frames.lock().unwrap().len(), 1);
+        let early = tokio::time::timeout(Duration::from_millis(2), starts.recv()).await;
+        if early.is_ok() {
+            cache.write().unwrap().insert(target, [0x52; 32], 20_000, 2);
+            updated.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let cancelled_before_shutdown = held.active.load(Ordering::Relaxed) == 0;
+        shutdown.send(true).unwrap();
+        task.await.unwrap();
+        assert_eq!(early.unwrap(), Some(target));
+        assert!(cancelled_before_shutdown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_miss_keeps_the_full_legacy_wait() {
+        use veil_proto::priority::BACKGROUND;
+        let HeldHandler {
+            input,
+            shutdown,
+            task,
+            mut starts,
+            ..
+        } = held_handler_with_backoff([500, 1000, 2000]);
+        let target = [0x51; 32];
+        input.send((target, BACKGROUND)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(3499), starts.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(starts.recv().await, Some(target));
+        shutdown.send(true).unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -632,6 +735,7 @@ mod tests {
             mut starts,
             held,
             broadcaster: frames,
+            ..
         } = held_handler();
         tx.send(([0x41; 32], 1)).await.unwrap();
         assert_eq!(starts.recv().await, Some([0x41; 32]));
